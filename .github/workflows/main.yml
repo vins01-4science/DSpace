@@ -4,17 +4,16 @@ on:
   schedule:
     - cron: '0 * * * *' # Run every hour
   workflow_dispatch:
-
 jobs:
   sync-upstream:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout your branch
+      - name: Checkout main-cris branch
         uses: actions/checkout@v4
         with:
           ref: main-cris
 
-      - name: Set up Git credentials
+      - name: Set up Git config
         run: |
           git config --global user.email "vincenzo.mecca@4science.com"
           git config --global user.name "vins01-4science"
@@ -25,18 +24,29 @@ jobs:
       - name: Fetch upstream
         run: git fetch upstream
 
-      - name: Create PR to port changes
+      - name: Merge upstream/main into main-cris
+        run: |
+          git merge upstream/main || echo "Merge conflict. Creating PR for manual resolution."
+
+      - name: Push changes (if no conflict)
+        run: |
+          git push origin main-cris
+        continue-on-error: true
+
+      - name: Create Pull Request if merge conflicts
+        if: failure()
         uses: peter-evans/create-pull-request@v5
         with:
-          title: "Sync upstream changes"
-          body: "Automated PR to sync changes from upstream/main to mybranch"
+          title: "Sync upstream/main into main-cris (conflicts need resolution)"
+          body: "This PR ports changes from upstream/main to main-cris. Please resolve conflicts if present."
           base: main-cris
-          head: upstream/main
-          assignees: vins01-4science
-          branch: sync-upstream-main-to-mybranch
+          branch: sync-upstream-main-to-main-cris
           labels: upstream-sync
+          assignees: vins01-4science
 
-      - name: Attempt auto-merge if no conflicts
+      # Optional: Auto-merge if possible
+      - name: Attempt auto-merge PR if no conflicts
+        if: success()
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -44,7 +54,7 @@ jobs:
             const prs = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              head: 'sync-upstream-main-to-mybranch',
+              head: 'sync-upstream-main-to-main-cris',
               base: 'main-cris',
               state: 'open'
             });
@@ -55,13 +65,6 @@ jobs:
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   pull_number: pr.number
-                });
-              } else {
-                await github.rest.issues.addAssignees({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: pr.number,
-                  assignees: ['vins01-4science']
                 });
               }
             }
