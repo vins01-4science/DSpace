@@ -35,6 +35,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.sql.SQLException;
+import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
 
@@ -99,7 +100,7 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
     @Value("classpath:org/dspace/app/rest/simple-article.pdf")
     private Resource simpleArticle;
 
-    @Value("classpath:org/dspace/authority/orcid/orcid-record.xml")
+    @Value("classpath:org/dspace/authority/orcid/orcid-person-record.xml")
     private Resource orcidPersonRecord;
 
     private EPerson submitter;
@@ -685,7 +686,6 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
             .build();
 
         Item publication = ItemBuilder.createItem(context, publicationCollection)
-            .withEntityType("Publication")
             .withAuthor("Walter White", AuthorityValueService.GENERATE + "ORCID::0000-0002-9079-593X")
             .build();
 
@@ -714,7 +714,6 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
         createCollection("Collection of persons", "Person", subCommunity);
 
         Item publication = ItemBuilder.createItem(context, publicationCollection)
-            .withEntityType("Publication")
             .withAuthor("Walter White", AuthorityValueService.GENERATE + "ORCID::0000-0002-9079-593X")
             .build();
 
@@ -745,7 +744,6 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
             .build();
 
         Item publication = ItemBuilder.createItem(context, publicationCollection)
-            .withEntityType("Publication")
             .withAuthor("Walter White", AuthorityValueService.REFERENCE + "ORCID::0000-0002-9079-593X")
             .build();
 
@@ -776,7 +774,6 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
         createCollection("Collection of persons", "Person", subCommunity);
 
         Item publication = ItemBuilder.createItem(context, publicationCollection)
-            .withEntityType("Publication")
             .withAuthor("Walter White", AuthorityValueService.REFERENCE + "ORCID::0000-0002-9079-593X")
             .build();
 
@@ -1040,7 +1037,6 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
             .build();
 
         Item publication = ItemBuilder.createItem(context, publicationCollection)
-            .withEntityType("Publication")
             .withAuthor("Walter White", AuthorityValueService.REFERENCE + "ORCID::0000-0002-9079-593X")
             .build();
 
@@ -1068,7 +1064,7 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
 
         String orcid = "0000-0002-9029-1854";
 
-        when(mockOrcidConnector.get(matches("^\\d{4}-\\d{4}-\\d{4}-\\d{4}$"), any()))
+        when(mockOrcidConnector.get(matches("^\\d{4}-\\d{4}-\\d{4}-\\d{4}/person$"), any()))
             .thenAnswer(i -> orcidPersonRecord.getInputStream());
 
         try {
@@ -1086,7 +1082,7 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
 
             context.restoreAuthSystemState();
 
-            verify(mockOrcidConnector).get(eq(orcid), any());
+            verify(mockOrcidConnector).get(eq(orcid + "/person"), any());
             verifyNoMoreInteractions(mockOrcidConnector);
 
             String authToken = getAuthToken(submitter.getEmail(), password);
@@ -1174,7 +1170,7 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
             assertThat(journal.getOwningCollection(), is(journals));
             assertThat(journal.getMetadata(), hasItems(
                 with("dc.title", "Nature Synthesis"),
-                with("dc.identifier.issn", issn),
+                with("creativeworkseries.issn", issn),
                 with("cris.sourceId", "ISSN::" + issn)));
 
             context.turnOffAuthorisationSystem();
@@ -1227,6 +1223,169 @@ public class CrisConsumerIT extends AbstractControllerIntegrationTest {
 
         // check that the entity type equals to the entity type of the owning collection
         assertThat(itemService.getEntityType(context.reloadEntity(wsitem.getItem())), is("Publication"));
+    }
+
+    @Test
+    public void testAuthorityOnMultipleEntityTypesShouldResolveReference() throws Exception {
+        context.turnOffAuthorisationSystem();
+
+        // set configurations
+        configurationService.addPropertyValue("plugin.named.org.dspace.content.authority.ChoiceAuthority",
+            "org.dspace.content.authority.ItemAuthority = PersonOrgUnitAuthority");
+        configurationService.addPropertyValue("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", "Person");
+        configurationService.addPropertyValue("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", "OrgUnit");
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.primaryEntityType", "Person");
+        configurationService.setProperty("choices.plugin.dc.contributor.author", "PersonOrgUnitAuthority");
+
+        Collection personCollection = createCollection("Person Collection", "Person", subCommunity);
+
+        Item item = ItemBuilder
+            .createItem(context, personCollection)
+            .withTitle("Francesco Pio Scognamiglio")
+            .withLegacyId("538cd81a-5c00-4c15-8f4e-b7ffbed225e3")
+            .inArchive().build();
+
+        Item testItem = ItemBuilder
+            .createItem(context, publicationCollection)
+            .withTitle("Test Item")
+            .withLegacyId("CNCE013761")
+            .withAuthor("Scognamiglio, Francesco Pio",
+                "will be referenced::LEGACY-ID::538cd81a-5c00-4c15-8f4e-b7ffbed225e3", 600)
+            .inArchive().build();
+
+        context.commit();
+        testItem = context.reloadEntity(testItem);
+
+        List<MetadataValue> metadata = testItem.getMetadata();
+        assertThat(metadata, hasItems(with("dc.contributor.author",
+            "Scognamiglio, Francesco Pio", item.getID().toString(),
+            0, 600)));
+
+        // revert changes on configurations
+        configurationService.addPropertyValue("plugin.named.org.dspace.content.authority.ChoiceAuthority",
+            "org.dspace.content.authority.ItemAuthority = PersonAuthority");
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", null);
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.primaryEntityType", null);
+        configurationService.setProperty("choices.plugin.dc.contributor.author", "PersonAuthority");
+        metadataAuthorityService.clearCache();
+        choiceAuthorityService.clearCache();
+    }
+
+    @Test
+    public void testAuthorityOnMultipleEntityTypesWithPrimaryEntityTypeShouldCreateItem() throws Exception {
+        context.turnOffAuthorisationSystem();
+
+        // set configurations
+        configurationService.addPropertyValue("plugin.named.org.dspace.content.authority.ChoiceAuthority",
+            "org.dspace.content.authority.ItemAuthority = PersonOrgUnitAuthority");
+        configurationService.addPropertyValue("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", "Person");
+        configurationService.addPropertyValue("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", "OrgUnit");
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.primaryEntityType", "Person");
+        configurationService.setProperty("choices.plugin.dc.contributor.author", "PersonOrgUnitAuthority");
+
+        Collection personCollection = createCollection("Person Collection", "Person", subCommunity);
+
+        Item testItem = ItemBuilder
+            .createItem(context, publicationCollection)
+            .withTitle("Test Item")
+            .withLegacyId("CNCE013761")
+            .withAuthor("Scognamiglio, Francesco Pio")
+            .inArchive().build();
+
+        context.commit();
+        testItem = context.reloadEntity(testItem);
+        publicationCollection = context.reloadEntity(publicationCollection);
+        personCollection = context.reloadEntity(personCollection);
+
+        Iterator<Item> people = itemService.findByCollection(context, personCollection);
+        assertThat(people.hasNext(), is(true));
+        Item person = people.next();
+
+        List<MetadataValue> metadata = testItem.getMetadata();
+        assertThat(metadata, hasItems(with("dc.contributor.author",
+            "Scognamiglio, Francesco Pio", person.getID().toString(), 0, 600)));
+
+        // revert changes on configurations
+        configurationService.addPropertyValue("plugin.named.org.dspace.content.authority.ChoiceAuthority",
+            "org.dspace.content.authority.ItemAuthority = PersonAuthority");
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", null);
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.primaryEntityType", null);
+        configurationService.setProperty("choices.plugin.dc.contributor.author", "PersonAuthority");
+        metadataAuthorityService.clearCache();
+        choiceAuthorityService.clearCache();
+    }
+
+    @Test
+    public void testAuthorityOnMultipleEntityTypesWithoutPrimaryEntityTypeShouldNotCreateItem() throws Exception {
+        context.turnOffAuthorisationSystem();
+
+        // set configurations
+        configurationService.addPropertyValue("plugin.named.org.dspace.content.authority.ChoiceAuthority",
+            "org.dspace.content.authority.ItemAuthority = PersonOrgUnitAuthority");
+        configurationService.addPropertyValue("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", "Person");
+        configurationService.addPropertyValue("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", "OrgUnit");
+        // remove property to simulate no primary entity type
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.primaryEntityType", null);
+        configurationService.setProperty("choices.plugin.dc.contributor.author", "PersonOrgUnitAuthority");
+
+        metadataAuthorityService.clearCache();
+        choiceAuthorityService.clearCache();
+
+        Collection personCollection = createCollection("Person Collection", "Person", subCommunity);
+
+        Item testItem = ItemBuilder
+            .createItem(context, publicationCollection)
+            .withTitle("Test Item")
+            .withLegacyId("CNCE013761")
+            .withAuthor("Scognamiglio, Francesco Pio")
+            .inArchive().build();
+
+        context.commit();
+        testItem = context.reloadEntity(testItem);
+        publicationCollection = context.reloadEntity(publicationCollection);
+        personCollection = context.reloadEntity(personCollection);
+
+        Iterator<Item> people = itemService.findByCollection(context, personCollection);
+        assertThat(people.hasNext(), is(false));
+
+        List<MetadataValue> metadata = testItem.getMetadata();
+        assertThat(metadata, hasItems(with("dc.contributor.author", "Scognamiglio, Francesco Pio")));
+
+        // revert changes on configurations
+        configurationService.addPropertyValue("plugin.named.org.dspace.content.authority.ChoiceAuthority",
+            "org.dspace.content.authority.ItemAuthority = PersonAuthority");
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.entityType", null);
+        configurationService.setProperty("cris.ItemAuthority.PersonOrgUnitAuthority.primaryEntityType", null);
+        configurationService.setProperty("choices.plugin.dc.contributor.author", "PersonAuthority");
+        metadataAuthorityService.clearCache();
+        choiceAuthorityService.clearCache();
+    }
+
+    @Test
+    public void testAuthorityOnSingleEntityTypeWithoutPrimaryEntityTypeShouldCreateItem() throws Exception {
+        context.turnOffAuthorisationSystem();
+
+        Collection personCollection = createCollection("Person Collection", "Person", subCommunity);
+
+        Item testItem = ItemBuilder
+            .createItem(context, publicationCollection)
+            .withTitle("Test Item")
+            .withLegacyId("CNCE013761")
+            .withAuthor("Scognamiglio, Francesco Pio")
+            .inArchive().build();
+
+        context.commit();
+        testItem = context.reloadEntity(testItem);
+        publicationCollection = context.reloadEntity(publicationCollection);
+        personCollection = context.reloadEntity(personCollection);
+
+        Iterator<Item> people = itemService.findByCollection(context, personCollection);
+        assertThat(people.hasNext(), is(true));
+        Item person = people.next();
+
+        List<MetadataValue> metadata = testItem.getMetadata();
+        assertThat(metadata, hasItems(with("dc.contributor.author",
+            "Scognamiglio, Francesco Pio", person.getID().toString(), 0, 600)));
     }
 
     private ItemRest getItemViaRestByID(String authToken, UUID id) throws Exception {

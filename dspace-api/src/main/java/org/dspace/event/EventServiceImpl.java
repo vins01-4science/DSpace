@@ -53,9 +53,6 @@ public class EventServiceImpl implements EventService {
 
     protected String CONSUMER_PFX = "event.consumer";
 
-    private static final ConfigurationService configurationService = DSpaceServicesFactory.getInstance()
-                                                                                          .getConfigurationService();
-
 
     protected EventServiceImpl() {
         initPool();
@@ -107,7 +104,7 @@ public class EventServiceImpl implements EventService {
         try {
             return (Dispatcher) dispatcherPool.borrowObject(name);
         } catch (Exception e) {
-            throw new IllegalStateException("Unable to aquire dispatcher named " + name, e);
+            throw new IllegalStateException("Unable to acquire dispatcher named " + name, e);
         }
 
     }
@@ -136,7 +133,8 @@ public class EventServiceImpl implements EventService {
 
     protected void enumerateConsumers() {
         // Get all configs starting with CONSUMER_PFX
-        List<String> propertyNames = configurationService.getPropertyKeys(CONSUMER_PFX);
+        List<String> propertyNames = DSpaceServicesFactory.getInstance()
+                                                          .getConfigurationService().getPropertyKeys(CONSUMER_PFX);
         int bitSetIndex = 0;
 
         if (consumerIndicies == null) {
@@ -159,7 +157,7 @@ public class EventServiceImpl implements EventService {
         // Prefix of keys in DSpace Configuration
         private static final String PROP_PFX = "event.dispatcher";
 
-        // Cache of event dispatchers, keyed by name, for re-use.
+        // Cache of event dispatchers, keyed by name, for reuse.
         protected Map<String, String> dispatchers = new HashMap<String, String>();
 
         public DispatcherPoolFactory() {
@@ -178,18 +176,19 @@ public class EventServiceImpl implements EventService {
             if (dispClass != null) {
                 try {
                     // all this to call a constructor with an argument
-                    final Class argTypes[] = {String.class};
+                    final Class[] argTypes = {String.class};
                     Constructor dc = Class.forName(dispClass).getConstructor(
                         argTypes);
-                    Object args[] = new Object[1];
+                    Object[] args = new Object[1];
                     args[0] = dispatcherName;
                     dispatcher = (Dispatcher) dc.newInstance(args);
 
                     // OK, now get its list of consumers/filters
                     String consumerKey = PROP_PFX + "." + dispatcherName
                         + ".consumers";
-                    String[] consumers = configurationService
-                        .getArrayProperty(consumerKey);
+                    String[] consumers = DSpaceServicesFactory.getInstance()
+                                                              .getConfigurationService()
+                                                              .getArrayProperty(consumerKey);
                     if (ArrayUtils.isEmpty(consumers)) {
                         throw new IllegalStateException(
                             "No Configuration entry found for consumer list of event Dispatcher: \""
@@ -290,6 +289,7 @@ public class EventServiceImpl implements EventService {
          */
         private void parseEventConfig() {
             // Get all configs starting with PROP_PFX
+            ConfigurationService configurationService = DSpaceServicesFactory.getInstance().getConfigurationService();
             List<String> propertyNames = configurationService.getPropertyKeys(PROP_PFX);
 
             for (String ckey : propertyNames) {
@@ -297,8 +297,7 @@ public class EventServiceImpl implements EventService {
                 if (ckey.endsWith(".class")) {
                     String name = ckey.substring(PROP_PFX.length() + 1, ckey
                         .length() - 6);
-                    String dispatcherClass = configurationService
-                        .getProperty(ckey);
+                    String dispatcherClass = configurationService.getProperty(ckey);
 
                     dispatchers.put(name, dispatcherClass);
 

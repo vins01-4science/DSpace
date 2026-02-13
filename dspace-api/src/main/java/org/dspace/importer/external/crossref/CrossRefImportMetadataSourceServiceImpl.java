@@ -20,9 +20,9 @@ import java.util.concurrent.Callable;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.el.MethodNotFoundException;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.apache.http.client.utils.URIBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -112,7 +112,7 @@ public class CrossRefImportMetadataSourceServiceImpl extends AbstractImportMetad
 
     @Override
     public Collection<ImportRecord> findMatchingRecords(Item item) throws MetadataSourceException {
-        throw new MethodNotFoundException("This method is not implemented for CrossRef");
+        throw new UnsupportedOperationException("This method is not implemented for CrossRef");
     }
 
     public String getID(String id) {
@@ -157,7 +157,7 @@ public class CrossRefImportMetadataSourceServiceImpl extends AbstractImportMetad
                 uriBuilder.addParameter("offset", start.toString());
             }
             Map<String, Map<String, String>> params = new HashMap<String, Map<String,String>>();
-            String response = liveImportClient.executeHttpGetRequest(1000, uriBuilder.toString(), params);
+            String response = liveImportClient.executeHttpGetRequest(30000, uriBuilder.toString(), params);
             if (StringUtils.isEmpty(response)) {
                 return results;
             }
@@ -336,7 +336,7 @@ public class CrossRefImportMetadataSourceServiceImpl extends AbstractImportMetad
             uriBuilder.setPath(uriBuilder.getPath() + "/" + query.getParameterAsClass("id", String.class));
             String responseString = liveImportClient.executeHttpGetRequest(1000, uriBuilder.toString(), params);
             JsonNode jsonNode = convertStringJsonToJsonNode(responseString);
-            return StringUtils.equals(jsonNode.at("/status").toString(), "ok") ? 1 : 0;
+            return Strings.CS.equals(jsonNode.at("/status").toString(), "ok") ? 1 : 0;
         }
     }
 

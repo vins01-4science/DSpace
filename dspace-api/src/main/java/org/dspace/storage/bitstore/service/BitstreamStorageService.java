@@ -92,7 +92,7 @@ public interface BitstreamStorageService {
      * @param assetstore    The assetstore number for the bitstream to be
      *                      registered
      * @param bitstreamPath The relative path of the bitstream to be registered.
-     *                      The path is relative to the path of ths assetstore.
+     *                      The path is relative to the path of this assetstore.
      * @return The ID of the registered bitstream
      * @throws SQLException       If a problem occurs accessing the RDBMS
      * @throws IOException        if IO error
@@ -193,5 +193,26 @@ public interface BitstreamStorageService {
      */
     @Nullable
     Long getLastModified(Bitstream bitstream) throws IOException;
+
+
+    /**
+     * Sets the number for the incoming store
+     * @param incoming
+     */
+    public void setIncomingExternal(int incoming);
+
+    /**
+     * Generate a presigned URL for direct access to the bitstream content.
+     * This allows downloading files directly from storage (S3, etc.) without going through DSpace.
+     *
+     * @param context   The current context
+     * @param bitstream The bitstream for which to generate the presigned URL
+     * @return The presigned URL as a string, or null if not supported by the storage backend
+     * @throws IOException        If a problem occurs while generating the URL
+     * @throws SQLException       If a problem occurs accessing the RDBMS
+     * @throws AuthorizeException Exception indicating the current user does not have permission
+     */
+    String getPresignedUrl(Context context, Bitstream bitstream)
+        throws IOException, SQLException, AuthorizeException;
 
 }

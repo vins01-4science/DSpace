@@ -14,11 +14,12 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.sql.SQLException;
-import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -31,6 +32,7 @@ import java.util.regex.Pattern;
 import org.apache.commons.collections4.ListUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.apache.logging.log4j.Logger;
 import org.dspace.authorize.AuthorizeException;
 import org.dspace.authorize.service.AuthorizeService;
@@ -90,7 +92,7 @@ public class ProcessServiceImpl implements ProcessService {
         process.setEPerson(ePerson);
         process.setName(scriptName);
         process.setParameters(DSpaceCommandLineParameter.concatenate(parameters));
-        process.setCreationTime(new Date());
+        process.setCreationTime(Instant.now());
         Optional.ofNullable(specialGroups)
             .ifPresent(sg -> {
                 // we use a set to be sure no duplicated special groups are stored with process
@@ -145,7 +147,7 @@ public class ProcessServiceImpl implements ProcessService {
     @Override
     public void start(Context context, Process process) throws SQLException {
         process.setProcessStatus(ProcessStatus.RUNNING);
-        process.setStartTime(new Date());
+        process.setStartTime(Instant.now());
         update(context, process);
         log.info(LogHelper.getHeader(context, "process_start", "Process with ID " + process.getID()
             + " and name " + process.getName() + " has started"));
@@ -155,7 +157,7 @@ public class ProcessServiceImpl implements ProcessService {
     @Override
     public void fail(Context context, Process process) throws SQLException {
         process.setProcessStatus(ProcessStatus.FAILED);
-        process.setFinishedTime(new Date());
+        process.setFinishedTime(Instant.now());
         update(context, process);
         log.info(LogHelper.getHeader(context, "process_fail", "Process with ID " + process.getID()
             + " and name " + process.getName() + " has failed"));
@@ -165,7 +167,7 @@ public class ProcessServiceImpl implements ProcessService {
     @Override
     public void complete(Context context, Process process) throws SQLException {
         process.setProcessStatus(ProcessStatus.COMPLETED);
-        process.setFinishedTime(new Date());
+        process.setFinishedTime(Instant.now());
         update(context, process);
         log.info(LogHelper.getHeader(context, "process_complete", "Process with ID " + process.getID()
             + " and name " + process.getName() + " has been completed"));
@@ -278,7 +280,7 @@ public class ProcessServiceImpl implements ProcessService {
     @Override
     public Bitstream getBitstreamByName(Context context, Process process, String bitstreamName) {
         for (Bitstream bitstream : getBitstreams(context, process)) {
-            if (StringUtils.equals(bitstream.getName(), bitstreamName)) {
+            if (Strings.CS.equals(bitstream.getName(), bitstreamName)) {
                 return bitstream;
             }
         }
@@ -295,7 +297,7 @@ public class ProcessServiceImpl implements ProcessService {
         } else {
             if (allBitstreams != null) {
                 for (Bitstream bitstream : allBitstreams) {
-                    if (StringUtils.equals(bitstreamService.getMetadata(bitstream,
+                    if (Strings.CS.equals(bitstreamService.getMetadata(bitstream,
                                                                         Process.BITSTREAM_TYPE_METADATAFIELD), type)) {
                         return bitstream;
                     }
@@ -377,40 +379,55 @@ public class ProcessServiceImpl implements ProcessService {
 
     @Override
     public List<Process> findByStatusAndCreationTimeOlderThan(Context context, List<ProcessStatus> statuses,
-        Date date) throws SQLException {
+        Instant date) throws SQLException {
         return this.processDAO.findByStatusAndCreationTimeOlderThan(context, statuses, date);
     }
 
     @Override
     public void failRunningProcesses(Context context) throws SQLException, IOException, AuthorizeException {
         List<Process> processesToBeFailed = findByStatusAndCreationTimeOlderThan(
-                context, List.of(ProcessStatus.RUNNING, ProcessStatus.SCHEDULED), new Date());
+                context, List.of(ProcessStatus.RUNNING, ProcessStatus.SCHEDULED), Instant.now());
         for (Process process : processesToBeFailed) {
+            if (isOrchestratorProcess(process)) {
+                continue;
+            }
             context.setCurrentUser(process.getEPerson());
             // Fail the process.
             log.info("Process with ID {} did not complete before tomcat shutdown, failing it now.", process.getID());
             fail(context, process);
             // But still attach its log to the process.
-            appendLog(process.getID(), process.getName(),
-                      "Process did not complete before tomcat shutdown.",
+            appendLog(process.getID(), process.getName(), "Process did not complete before tomcat shutdown.",
                       ProcessLogLevel.ERROR);
             createLogBitstream(context, process);
         }
     }
 
+    private boolean isOrchestratorProcess(Process process) {
+        String taskExecutorBeanName = configurationService.getProperty("dspace.task.executor");
+        if (!StringUtils.equals(taskExecutorBeanName, "orchestratorTaskExecutor")) {
+            return false;
+        }
+
+        if (process == null || StringUtils.isBlank(process.getName())) {
+            return false;
+        }
+
+        List<String> processIgnoreByOrchestrator =
+            Arrays.asList(configurationService.getArrayProperty("orchestrator.ignore-script"));
+        return !processIgnoreByOrchestrator.contains(process.getName());
+    }
+
     private String formatLogLine(int processId, String scriptName, String output, ProcessLogLevel processLogLevel) {
-        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
-        StringBuilder sb = new StringBuilder();
-        sb.append(sdf.format(new Date()));
-        sb.append(" ");
-        sb.append(processLogLevel);
-        sb.append(" ");
-        sb.append(scriptName);
-        sb.append(" - ");
-        sb.append(processId);
-        sb.append(" @ ");
-        sb.append(output);
-        return  sb.toString();
+        String sb = DateTimeFormatter.ISO_INSTANT.format(Instant.now()) +
+            " " +
+            processLogLevel +
+            " " +
+            scriptName +
+            " - " +
+            processId +
+            " @ " +
+            output;
+        return sb;
     }
 
     private File getLogsDirectory() {

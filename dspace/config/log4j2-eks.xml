@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Logging configuration for DSpace command line tools -->
+<Configuration strict="true"
+               xmlns="http://logging.apache.org/log4j/2.0/config">
+
+    <Properties>
+        <Property name="loglevel.dspace">INFO</Property>
+        <Property name="loglevel.other">INFO</Property>
+    </Properties>
+
+    <Appenders>
+        <!-- JSON console appender for org.dspace -->
+        <Appender name="ConsoleJson" type="Console">
+            <!--<Layout
+                    type="JsonLayout"
+                    complete="false"
+                    compact="true"
+                    eventEol="true"
+                    properties="true"
+            />-->
+            <JsonTemplateLayout
+                eventTemplate='{
+                    "timestamp": {
+                      "$resolver": "timestamp",
+                      "pattern": {
+                        "format": "yyyy-MM-dd&apos;T&apos;HH:mm:ss.SSS&apos;Z&apos;",
+                        "timeZone": "UTC",
+                        "locale": "en_US"
+                      }
+                    },
+                    "correlationID": {
+                      "$resolver": "mdc",
+                      "key": "correlationID",
+                      "default": "unknown"
+                    },
+                    "requestID": {
+                      "$resolver": "mdc",
+                      "key": "requestID",
+                      "default": "unknown"
+                    },
+                    "level": { "$resolver": "level", "field": "name" },
+                    "logger": { "$resolver": "logger", "field": "name" },
+                    "loggerFqcn": { "$resolver": "logger", "field": "fqcn" },
+                    "thread": { "$resolver": "thread", "field": "name" },
+                    "threadId": { "$resolver": "thread", "field": "id" },
+                    "threadPriority": { "$resolver": "thread", "field": "priority" },
+                    "pid": { "$resolver": "pattern", "pattern": "%pid", "stackTraceEnabled": false },
+                    "host": { "$resolver": "pattern", "pattern": "${hostName}", "stackTraceEnabled": false },
+                    "marker": { "$resolver": "marker", "field": "name" },
+                    "endOfBatch": { "$resolver": "endOfBatch" },
+                    "message": { "$resolver": "message", "stringified": true },
+                    "contextStack": { "$resolver": "ndc" },
+                    "exception": { "$resolver": "exception", "field": "stackTrace", "stackTrace": { "stringified": true } }
+              }'
+            />
+        </Appender>
+
+    </Appenders>
+
+    <Loggers>
+
+        <!-- Most parts of DSpace (now to JSON Console) -->
+        <Logger name="org.dspace"
+                level="${loglevel.dspace}"
+                additivity="false">
+            <AppenderRef ref="ConsoleJson"/>
+        </Logger>
+
+        <!-- Block beanutil logging except on exceptions -->
+        <Logger name="org.apache.commons.beanutils"
+                level="ERROR"/>
+        <!-- Block Hibernate DefaultLoadEventListener logging except on exceptions -->
+        <Logger name="org.hibernate.event.internal.DefaultLoadEventListener"
+                level="ERROR"/>
+        <!-- Block services logging except on exceptions -->
+        <Logger name="org.dspace.kernel"
+                level="ERROR"/>
+        <Logger name="org.dspace.services"
+                level="ERROR"/>
+        <Logger name="org.dspace.servicemanager"
+                level="WARN"/>
+        <Logger name="org.dspace.providers"
+                level="ERROR"/>
+        <Logger name="org.dspace.utils"
+                level="ERROR"/>
+        <!--        Uncomment to log all the requests with header and body using WebSecurityConfiguration.java:143  -->
+        <!--        <Logger name='org.springframework.web.filter.CommonsRequestLoggingFilter'-->
+        <!--                level='DEBUG'/>-->
+        <!-- Block passwords from being exposed in Axis logs -->
+        <Logger name="org.apache.axis.handlers.http.HTTPAuthHandler"
+                level="INFO"/>
+        <!-- Anything not a part of DSpace -->
+        <Root level="${loglevel.other}">
+            <AppenderRef ref="ConsoleJson"/>
+        </Root>
+    </Loggers>
+</Configuration>

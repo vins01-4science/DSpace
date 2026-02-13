@@ -260,14 +260,14 @@
     <qualifier>other</qualifier>
     <scope_note>A known identifier type common to a local collection.</scope_note>
   </dc-type>
-  
+
   <dc-type>
     <schema>dc</schema>
     <element>identifier</element>
     <qualifier>doi</qualifier>
     <scope_note>The doi identifier minted by this repository.</scope_note>
   </dc-type>
-  
+
   <dc-type>
     <schema>dc</schema>
     <element>identifier</element>
@@ -277,28 +277,14 @@
 
   <!-- Used by system: do not remove -->
   <dc-type>
-	<schema>dc</schema>
+	  <schema>dc</schema>
     <element>identifier</element>
     <qualifier>uri</qualifier>
     <scope_note>Uniform Resource Identifier</scope_note>
   </dc-type>
 
   <dc-type>
-	<schema>dc</schema>
-    <element>identifier</element>
-    <qualifier>doi</qualifier>
-    <scope_note>Digital object identifier</scope_note>
-  </dc-type>
-
-  <dc-type>
-	<schema>dc</schema>
-    <element>identifier</element>
-    <qualifier>scopus</qualifier>
-    <scope_note>Scopus Identifier</scope_note>
-  </dc-type>
-
-  <dc-type>
-	<schema>dc</schema>
+	  <schema>dc</schema>
     <element>identifier</element>
     <qualifier>isi</qualifier>
     <scope_note>Web of Knowledge Identifier</scope_note>
@@ -687,21 +673,21 @@
     <qualifier></qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>relation</element>
     <qualifier>publication</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>relation</element>
     <qualifier>isbn</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>relation</element>
@@ -715,7 +701,7 @@
     <qualifier>issn</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>relation</element>
@@ -743,49 +729,49 @@
     <qualifier>publication</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>coverage</element>
     <qualifier>isbn</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>coverage</element>
     <qualifier>doi</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>description</element>
     <qualifier>volume</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>description</element>
     <qualifier>issue</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>description</element>
     <qualifier>startpage</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>description</element>
     <qualifier>endpage</qualifier>
     <scope_note></scope_note>
   </dc-type>
-  
+
   <dc-type>
 	<schema>dc</schema>
     <element>identifier</element>
@@ -827,5 +813,12 @@
     <qualifier>ipc</qualifier>
     <scope_note></scope_note>
   </dc-type>
+
+    <dc-type>
+        <schema>dc</schema>
+        <element>identifier</element>
+        <qualifier>openalex</qualifier>
+        <scope_note>The OpenAlex identifier</scope_note>
+    </dc-type>
 
 </dspace-dc-types>

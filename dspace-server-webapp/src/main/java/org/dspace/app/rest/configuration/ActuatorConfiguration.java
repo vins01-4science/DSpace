@@ -12,11 +12,12 @@ import java.net.MalformedURLException;
 import java.util.Arrays;
 
 import org.apache.solr.client.solrj.SolrServerException;
-import org.dspace.app.audit.AuditService;
+import org.dspace.app.audit.AuditSolrServiceImpl;
 import org.dspace.app.deduplication.service.impl.SolrDedupServiceImpl;
 import org.dspace.app.rest.DiscoverableEndpointsService;
 import org.dspace.app.rest.health.EPersonGroupHealthIndicator;
 import org.dspace.app.rest.health.GeoIpHealthIndicator;
+import org.dspace.app.rest.health.SEOHealthIndicator;
 import org.dspace.app.rest.health.SiteHealthIndicator;
 import org.dspace.app.rest.health.SolrHealthIndicator;
 import org.dspace.app.suggestion.SolrSuggestionStorageServiceImpl;
@@ -90,8 +91,8 @@ public class ActuatorConfiguration {
 
     @Bean
     @ConditionalOnEnabledHealthIndicator("solrAudit")
-    @ConditionalOnProperty("solr.audit.server")
-    public SolrHealthIndicator solrAuditHealthIndicator(AuditService auditService)
+    @ConditionalOnProperty("audit.solr.server")
+    public SolrHealthIndicator solrAuditHealthIndicator(AuditSolrServiceImpl auditService)
         throws MalformedURLException, SolrServerException, IOException {
         return new SolrHealthIndicator(auditService.getSolr());
     }
@@ -118,6 +119,12 @@ public class ActuatorConfiguration {
     public SolrHealthIndicator solrSuggestionHealthIndicator(SolrSuggestionStorageServiceImpl solrSuggestionStrgService)
             throws MalformedURLException, SolrServerException, IOException {
         return new SolrHealthIndicator(solrSuggestionStrgService.getSolr());
+    }
+
+    @Bean
+    @ConditionalOnEnabledHealthIndicator("seo")
+    public SEOHealthIndicator seoHealthIndicator() {
+        return new SEOHealthIndicator();
     }
 
     @Bean
