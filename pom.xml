@@ -715,6 +715,95 @@
         </profile>
 
         <!--
+            Test/class dependency graph: collect one JaCoCo .exec file per test method
+            (via the dspace-test-trace listener) so a test -> classes graph can be built.
+            Activate with -Ptest-class-graph. The JaCoCo javaagent is attached with JMX
+            enabled (output=none) so the listener can dump & reset execution data per test.
+        -->
+        <profile>
+            <id>test-class-graph</id>
+            <activation>
+                <activeByDefault>false</activeByDefault>
+            </activation>
+            <build>
+                <plugins>
+                    <!-- Copy the JaCoCo javaagent runtime jar to a fixed path referenced by the argLine -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-dependency-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>copy-jacoco-agent</id>
+                                <phase>process-test-classes</phase>
+                                <goals>
+                                    <goal>copy</goal>
+                                </goals>
+                                <configuration>
+                                    <artifactItems>
+                                        <artifactItem>
+                                            <groupId>org.jacoco</groupId>
+                                            <artifactId>org.jacoco.agent</artifactId>
+                                            <version>0.8.14</version>
+                                            <classifier>runtime</classifier>
+                                            <type>jar</type>
+                                            <outputDirectory>${project.build.directory}</outputDirectory>
+                                            <destFileName>jacoco-agent.jar</destFileName>
+                                        </artifactItem>
+                                    </artifactItems>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Unit tests: attach the JaCoCo agent (JMX enabled), ignore the default surefireJacoco property -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.5.3</version>
+                        <configuration>
+                            <argLine>${test.argLine} -javaagent:${project.build.directory}/jacoco-agent.jar=output=none,jmx=true,destfile=${project.build.directory}/per-test/jacoco.exec</argLine>
+                            <skipTests>${skipUnitTests}</skipTests>
+                            <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
+                        </configuration>
+                    </plugin>
+                    <!-- Integration tests: same agent wiring for Failsafe -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>3.5.3</version>
+                        <configuration>
+                            <argLine>${test.argLine} -javaagent:${project.build.directory}/jacoco-agent.jar=output=none,jmx=true,destfile=${project.build.directory}/per-test/jacoco.exec</argLine>
+                            <skipTests>${skipIntegrationTests}</skipTests>
+                            <failIfNoSpecifiedTests>false</failIfNoSpecifiedTests>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+            <dependencies>
+                <!-- Per-test coverage listener, auto-discovered via the JUnit Platform SPI -->
+                <dependency>
+                    <groupId>org.dspace</groupId>
+                    <artifactId>dspace-test-trace</artifactId>
+                    <version>${project.version}</version>
+                    <scope>test</scope>
+                </dependency>
+                <!-- Force the JUnit Platform provider (instead of the legacy junit4 provider) so
+                     the platform TestExecutionListener SPI is used. Vintage runs existing JUnit 4 tests. -->
+                <dependency>
+                    <groupId>org.junit.platform</groupId>
+                    <artifactId>junit-platform-launcher</artifactId>
+                    <version>1.11.4</version>
+                    <scope>test</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.junit.vintage</groupId>
+                    <artifactId>junit-vintage-engine</artifactId>
+                    <version>5.11.4</version>
+                    <scope>test</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+
+        <!--
              Generate a list of all THIRD PARTY open source licenses for all DSpace dependencies.
              This list is automatically written to the [src]/LICENSES_THIRD_PARTY file.
              Third party tools whose licenses are unknown by Maven are maintained in
