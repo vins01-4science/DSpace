@@ -245,6 +245,37 @@ public class TestGraph {
     private static final Pattern RE_METHOD_RET =
             Pattern.compile("(\\b[A-Z][\\w.<>\\[\\],\\s]*?)\\s+\\w+\\s*\\(");
 
+    // Curated mapping: DSpace XML metadata/form config files -> consumer classes.
+    // These files contain no <bean>/id attributes, so the generic extractor would
+    // ignore them. A change to such a file is mapped to the tests impacted by its
+    // consumer(s) via the existing class impact. Narrow per the registry-breadth choice.
+    private static final Map<String, String[]> CONFIG_CONSUMERS_BY_BASENAME = Map.of(
+            "submission-forms.xml", new String[]{
+                    "org.dspace.app.util.DCInputsReader",
+                    "org.dspace.app.util.DCInput",
+                    "org.dspace.app.util.Util",
+                    "org.dspace.content.authority.DCInputAuthority"},
+            "item-submission.xml", new String[]{
+                    "org.dspace.app.util.SubmissionConfigReader",
+                    "org.dspace.submit.service.SubmissionConfigServiceImpl",
+                    "org.dspace.content.authority.MetadataAuthorityServiceImpl",
+                    "org.dspace.content.edit.service.impl.EditItemModeServiceImpl",
+                    "org.dspace.validation.service.impl.ValidationServiceImpl"});
+    private static final String[] REGISTRY_CONSUMERS = {
+            "org.dspace.administer.MetadataImporter",
+            "org.dspace.administer.RegistryLoader"};
+
+    private static void collectConfigConsumers(Path f, List<String[]> out) {
+        String name = f.getFileName().toString();
+        String[] classes = CONFIG_CONSUMERS_BY_BASENAME.get(name);
+        if (classes != null) {
+            for (String cls : classes) out.add(new String[]{f.toString(), cls});
+        } else if (f.toString().contains("/config/registries/")
+                || f.toString().contains("\\config\\registries\\")) {
+            for (String cls : REGISTRY_CONSUMERS) out.add(new String[]{f.toString(), cls});
+        }
+    }
+
     private static void configCmd(Map<String, String> opts) throws IOException {
         Path module = Paths.get(require(opts, "module"));
         Path outDir = Paths.get(opts.getOrDefault("out",
@@ -255,6 +286,7 @@ public class TestGraph {
         List<String[]> beanRefs = new ArrayList<>();
         List<String[]> configKeys = new ArrayList<>();
         List<String[]> beanDecls = new ArrayList<>();
+        List<String[]> configConsumers = new ArrayList<>();
 
         // Java sources: property + bean references
         for (Path root : new Path[]{module.resolve("src/main/java"), module.resolve("src/test/java")}) {
@@ -282,6 +314,7 @@ public class TestGraph {
                     String rel = f.toString();
                     if (rel.endsWith(".xml")) {
                         extractXmlConfig(f, configKeys, beanDecls);
+                        collectConfigConsumers(f, configConsumers);
                     } else {
                         extractPropertiesConfig(f, configKeys);
                     }
@@ -303,6 +336,7 @@ public class TestGraph {
                 }).toList()) {
                     if (f.toString().endsWith(".xml")) {
                         extractXmlConfig(f, configKeys, beanDecls);
+                        collectConfigConsumers(f, configConsumers);
                     } else {
                         extractPropertiesConfig(f, configKeys);
                     }
@@ -314,9 +348,10 @@ public class TestGraph {
         writeTsv(outDir.resolve("bean_refs.tsv"), beanRefs);
         writeTsv(outDir.resolve("config_keys.tsv"), configKeys);
         writeTsv(outDir.resolve("bean_decls.tsv"), beanDecls);
+        writeTsv(outDir.resolve("config_consumers.tsv"), configConsumers);
         System.out.println("config: " + propRefs.size() + " property refs, " + beanRefs.size()
                 + " bean refs, " + configKeys.size() + " config keys, " + beanDecls.size()
-                + " bean decls -> " + outDir);
+                + " bean decls, " + configConsumers.size() + " config consumers -> " + outDir);
     }
 
     private static void extractJavaConfigRefs(String from, String src,
@@ -470,6 +505,7 @@ public class TestGraph {
         List<String[]> beanRefs = readTsv(configDir.resolve("bean_refs.tsv"));
         List<String[]> configKeys = readTsv(configDir.resolve("config_keys.tsv"));
         List<String[]> beanDecls = readTsv(configDir.resolve("bean_decls.tsv"));
+        List<String[]> configConsumers = readTsv(configDir.resolve("config_consumers.tsv"));
 
         // known class universe for folding bean edges
         Set<String> known = new HashSet<>();
@@ -633,16 +669,34 @@ public class TestGraph {
             } else if (opts.containsKey("configfile")) {
                 String path = opts.get("configfile");
                 Set<String> keys = fileKeys(c, path);
-                if (keys.isEmpty()) {
-                    if (!csv) System.err.println("Config file: " + path + " -> (no keys / not indexed)");
-                    return;
-                }
+                // property-key based impact (cfg/properties/yml + XML id/name attributes)
                 try (PreparedStatement ps = c.prepareStatement(
                         "SELECT test FROM property_impact WHERE key = ?")) {
                     for (String k : keys) {
                         ps.setString(1, k);
                         try (ResultSet rs = ps.executeQuery()) {
                             while (rs.next()) tests.add(rs.getString(1));
+                        }
+                    }
+                }
+                // config-file -> consumer class -> impact(class) -> tests.
+                // Covers XML metadata/form files (submission-forms.xml, item-submission.xml,
+                // dspace/config/registries/*.xml) that have no <bean>/id attributes to key on.
+                if (hasTable(c, "config_consumers")) {
+                    try (PreparedStatement psC = c.prepareStatement(
+                            "SELECT class FROM config_consumers WHERE " + fileMatchSql(path))) {
+                        setFileParam(psC, path);
+                        try (ResultSet rsC = psC.executeQuery()) {
+                            while (rsC.next()) {
+                                String cls = rsC.getString(1);
+                                try (PreparedStatement psT = c.prepareStatement(
+                                        "SELECT test FROM impact WHERE class = ?")) {
+                                    psT.setString(1, cls);
+                                    try (ResultSet rsT = psT.executeQuery()) {
+                                        while (rsT.next()) tests.add(rsT.getString(1));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -752,6 +806,16 @@ public class TestGraph {
         Path p = Paths.get(path).toAbsolutePath().normalize();
         ps.setString(1, p.toString());
         ps.setString(2, "%" + File.separator + p.getFileName().toString());
+    }
+
+    private static boolean hasTable(Connection c, String name) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
     }
 
     // ----------------------------------------------------------------- refine
@@ -951,6 +1015,7 @@ public class TestGraph {
         List<String[]> beanRefs = new ArrayList<>();
         List<String[]> configKeys = new ArrayList<>();
         List<String[]> beanDecls = new ArrayList<>();
+        List<String[]> configConsumers = new ArrayList<>();
 
         Class.forName("org.sqlite.JDBC");
         for (Path db : dbs) {
@@ -962,6 +1027,7 @@ public class TestGraph {
                 beanRefs.addAll(readDb(c, "SELECT from_c, ref, kind FROM bean_refs"));
                 configKeys.addAll(readDb(c, "SELECT file, key FROM config_keys"));
                 beanDecls.addAll(readDb(c, "SELECT file, bean_type, bean_id FROM bean_decls"));
+                configConsumers.addAll(readDb(c, "SELECT file, class FROM config_consumers"));
             }
         }
 
@@ -974,7 +1040,8 @@ public class TestGraph {
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out)) {
             c.setAutoCommit(false);
             String[] drops = {"class_refs", "test_covers", "impact",
-                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact"};
+                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
+                    "config_consumers"};
             for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
             c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
             c.createStatement().execute("CREATE TABLE test_covers(test TEXT, class TEXT)");
@@ -984,6 +1051,7 @@ public class TestGraph {
             c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
             c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
             c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
+            c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
             try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
                  PreparedStatement ps2 = c.prepareStatement("INSERT INTO test_covers VALUES (?,?)");
                  PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)");
@@ -991,7 +1059,8 @@ public class TestGraph {
                  PreparedStatement ps5 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
                  PreparedStatement ps6 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
                  PreparedStatement ps7 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
-                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)")) {
+                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)");
+                 PreparedStatement ps9 = c.prepareStatement("INSERT INTO config_consumers VALUES (?,?)")) {
                 for (Map.Entry<String, Set<String>> e : refs.entrySet())
                     for (String to : e.getValue()) { ps1.setString(1, e.getKey()); ps1.setString(2, to); ps1.setString(3, "reference"); ps1.addBatch(); }
                 for (Map.Entry<String, Set<String>> e : covers.entrySet())
@@ -1004,9 +1073,10 @@ public class TestGraph {
                 for (String[] r : beanDecls) { ps7.setString(1, r[0]); ps7.setString(2, r[1]); ps7.setString(3, r.length > 2 ? r[2] : ""); ps7.addBatch(); }
                 for (Map.Entry<String, Set<String>> e : propImpact.entrySet())
                     for (String t : e.getValue()) { ps8.setString(1, e.getKey()); ps8.setString(2, t); ps8.addBatch(); }
+                for (String[] r : configConsumers) { ps9.setString(1, r[0]); ps9.setString(2, r[1]); ps9.addBatch(); }
                 ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
                 ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
-                ps7.executeBatch(); ps8.executeBatch();
+                ps7.executeBatch(); ps8.executeBatch(); ps9.executeBatch();
             }
             c.commit();
         }

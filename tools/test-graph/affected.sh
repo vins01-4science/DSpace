@@ -76,6 +76,12 @@ for f in "${FILES[@]:-}"; do
     while IFS= read -r t; do
       [[ -n "$t" ]] && ALL["$t"]=1
     done < <("$TG" impacted --csv --db "$DB" --beanfile "$REPO/$f" 2>/dev/null || true)
+  elif [[ "$f" == *.xml ]]; then
+    # non-spring XML metadata/form config (submission-forms.xml, item-submission.xml,
+    # dspace/config/registries/*.xml) — mapped to tests via the curated consumer-class map
+    while IFS= read -r t; do
+      [[ -n "$t" ]] && ALL["$t"]=1
+    done < <("$TG" impacted --csv --db "$DB" --configfile "$REPO/$f" 2>/dev/null || true)
   fi
 done
 
