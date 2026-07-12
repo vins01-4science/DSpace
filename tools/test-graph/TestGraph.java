@@ -616,19 +616,27 @@ public class TestGraph {
 
     private static void impactedCmd(Map<String, String> opts) throws Exception {
         Path db = Paths.get(require(opts, "db"));
-
+        boolean csv = opts.containsKey("csv");
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+            Set<String> tests = new TreeSet<>();
             if (opts.containsKey("property")) {
                 String key = opts.get("property");
-                queryTests(c, "SELECT test FROM property_impact WHERE key = ? ORDER BY test",
-                        key, "Property: " + key);
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT test FROM property_impact WHERE key = ? ORDER BY test")) {
+                    ps.setString(1, key);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) tests.add(rs.getString(1));
+                    }
+                }
+                emit(tests, csv, "Property: " + key);
             } else if (opts.containsKey("configfile")) {
                 String path = opts.get("configfile");
                 Set<String> keys = fileKeys(c, path);
-                System.out.println("Config file: " + path);
-                if (keys.isEmpty()) { System.out.println("  (no keys / not indexed)"); return; }
-                Set<String> tests = new TreeSet<>();
+                if (keys.isEmpty()) {
+                    if (!csv) System.err.println("Config file: " + path + " -> (no keys / not indexed)");
+                    return;
+                }
                 try (PreparedStatement ps = c.prepareStatement(
                         "SELECT test FROM property_impact WHERE key = ?")) {
                     for (String k : keys) {
@@ -638,9 +646,7 @@ public class TestGraph {
                         }
                     }
                 }
-                System.out.println("Tests to re-run (" + tests.size() + "):");
-                if (tests.isEmpty()) System.out.println("  (none)");
-                else tests.forEach(t -> System.out.println("  " + t));
+                emit(tests, csv, "Config file: " + path);
             } else if (opts.containsKey("bean")) {
                 String bean = opts.get("bean");
                 String type = bean.contains(".") ? topLevel(bean) : null;
@@ -657,9 +663,10 @@ public class TestGraph {
                         }
                     }
                 }
-                System.out.println("Bean: " + bean + (type == null ? " (id)" : " (type)"));
-                if (types.isEmpty()) { System.out.println("  (no matching bean type)"); return; }
-                Set<String> tests = new TreeSet<>();
+                if (types.isEmpty()) {
+                    if (!csv) System.err.println("Bean: " + bean + " -> (no matching bean type)");
+                    return;
+                }
                 try (PreparedStatement ps = c.prepareStatement(
                         "SELECT test FROM impact WHERE class = ?")) {
                     for (String t : types) {
@@ -669,9 +676,7 @@ public class TestGraph {
                         }
                     }
                 }
-                System.out.println("Tests to re-run (" + tests.size() + "):");
-                if (tests.isEmpty()) System.out.println("  (none)");
-                else tests.forEach(t -> System.out.println("  " + t));
+                emit(tests, csv, "Bean: " + bean + (type == null ? " (id)" : " (type)"));
             } else if (opts.containsKey("beanfile")) {
                 String path = opts.get("beanfile");
                 Set<String> types = new TreeSet<>();
@@ -682,9 +687,10 @@ public class TestGraph {
                         while (rs.next()) types.add(topLevel(rs.getString(1)));
                     }
                 }
-                System.out.println("Bean file: " + path);
-                if (types.isEmpty()) { System.out.println("  (no bean declarations indexed)"); return; }
-                Set<String> tests = new TreeSet<>();
+                if (types.isEmpty()) {
+                    if (!csv) System.err.println("Bean file: " + path + " -> (no bean declarations indexed)");
+                    return;
+                }
                 try (PreparedStatement ps = c.prepareStatement(
                         "SELECT test FROM impact WHERE class = ?")) {
                     for (String t : types) {
@@ -694,9 +700,7 @@ public class TestGraph {
                         }
                     }
                 }
-                System.out.println("Tests to re-run (" + tests.size() + "):");
-                if (tests.isEmpty()) System.out.println("  (none)");
-                else tests.forEach(t -> System.out.println("  " + t));
+                emit(tests, csv, "Bean file: " + path);
             } else {
                 String file = require(opts, "file");
                 String fqcn = pathToFqcn(file);
@@ -705,22 +709,27 @@ public class TestGraph {
                             + "src/main/java or src/test/java, or the fully-qualified class name.");
                     System.exit(1);
                 }
-                System.out.println("Changed class: " + fqcn);
                 try (PreparedStatement ps = c.prepareStatement(
                         "SELECT test FROM impact WHERE class = ? ORDER BY test")) {
                     ps.setString(1, fqcn);
                     try (ResultSet rs = ps.executeQuery()) {
-                        boolean any = false;
-                        System.out.println("Tests to re-run:");
-                        while (rs.next()) {
-                            any = true;
-                            System.out.println("  " + rs.getString(1));
-                        }
-                        if (!any) System.out.println("  (none)");
+                        while (rs.next()) tests.add(rs.getString(1));
                     }
                 }
+                emit(tests, csv, "Changed class: " + fqcn);
             }
         }
+    }
+
+    private static void emit(Set<String> tests, boolean csv, String label) {
+        if (csv) {
+            tests.forEach(System.out::println);
+            return;
+        }
+        System.out.println(label);
+        System.out.println("Tests to re-run (" + tests.size() + "):");
+        if (tests.isEmpty()) System.out.println("  (none)");
+        else tests.forEach(t -> System.out.println("  " + t));
     }
 
     private static Set<String> fileKeys(Connection c, String path) throws Exception {
@@ -743,22 +752,6 @@ public class TestGraph {
         Path p = Paths.get(path).toAbsolutePath().normalize();
         ps.setString(1, p.toString());
         ps.setString(2, "%" + File.separator + p.getFileName().toString());
-    }
-
-    private static void queryTests(Connection c, String sql, String param, String label) throws Exception {
-        System.out.println(label);
-        try (PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setString(1, param);
-            try (ResultSet rs = ps.executeQuery()) {
-                boolean any = false;
-                System.out.println("Tests to re-run:");
-                while (rs.next()) {
-                    any = true;
-                    System.out.println("  " + rs.getString(1));
-                }
-                if (!any) System.out.println("  (none)");
-            }
-        }
     }
 
     // ----------------------------------------------------------------- refine
@@ -823,6 +816,10 @@ public class TestGraph {
             if (hit) inScope.add(test);
         }
 
+        if (opts.containsKey("csv")) {
+            inScope.forEach(System.out::println);
+            return;
+        }
         System.out.println("refine: " + candidates.size() + " tests at class-level impact, "
                 + inScope.size() + " tests actually cover changed lines/methods");
         System.out.println("Changed classes: " + changed.keySet());
@@ -1185,8 +1182,12 @@ public class TestGraph {
         Map<String, String> m = new HashMap<>();
         for (int i = from; i < args.length; i++) {
             String a = args[i];
-            if (a.startsWith("--") && i + 1 < args.length) {
-                m.put(a.substring(2), args[++i]);
+            if (a.startsWith("--")) {
+                if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+                    m.put(a.substring(2), args[++i]);
+                } else {
+                    m.put(a.substring(2), ""); // boolean flag
+                }
             }
         }
         return m;

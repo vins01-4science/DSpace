@@ -1,0 +1,138 @@
+# Test Affected (PR gate) — runs ONLY the tests impacted by a pull request.
+#
+# Flow (matching the branch-from-`main` workflow):
+#   1. Download the baseline impact-index built from the branch this PR targets
+#      (impact-index.yml, published on `main` pushes). Falls back to `main`.
+#   2. Diff the PR (base...head) and, for every changed source/config/bean file,
+#      look up the impacted tests in the baseline index (tools/test-graph/affected.sh).
+#   3. Run only those tests:
+#        - unit tests always (root reactor, -Dtest=<csv>)
+#        - integration tests only when an affected test is an IT (-Dit.test=<csv>)
+#      If nothing is affected (docs-only / new file), fall back to running the
+#      full suite of the touched modules.
+#
+# This job does NOT rebuild the index and does NOT attach the JaCoCo agent;
+# it just re-runs the already-selected tests.
+name: Test Affected (PR)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read   # checkout + read PR metadata
+  actions: read    # download the impact-index artifact from another workflow run
+
+jobs:
+  affected-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MAVEN_OPTS: "-Xmx2048M"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ---- 1. download the baseline index from the targeted base branch ----
+      - name: Download baseline impact-index
+        id: baseline
+        run: |
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$BASE_BRANCH" \
+                    --workflow impact-index.yml --status success --limit 1 \
+                    --json databaseId --jq '.[0].databaseId' || true)
+          if [ -z "$RUN_ID" ]; then
+            echo "No baseline index for $BASE_BRANCH, falling back to main"
+            RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch main \
+                      --workflow impact-index.yml --status success --limit 1 \
+                      --json databaseId --jq '.[0].databaseId' || true)
+          fi
+          if [ -n "$RUN_ID" ]; then
+            gh run download "$RUN_ID" -n impact-index -D ./idx
+            echo "db=./idx/root-index.sqlite" >> "$GITHUB_OUTPUT"
+            echo "Downloaded baseline index from run $RUN_ID (built from $(cat ./idx/built-from.txt 2>/dev/null || echo unknown))"
+          else
+            echo "db=" >> "$GITHUB_OUTPUT"
+            echo "No baseline impact-index available yet -> will fall back to module suites"
+          fi
+
+      # ---- 2. compute affected tests from the diff ----
+      - name: Compute affected tests
+        id: affected
+        run: |
+          DB="${{ steps.baseline.outputs.db }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$DB" ]; then
+            bash tools/test-graph/affected.sh --db "$DB" --base "$BASE_SHA" --head "$HEAD_SHA" \
+              --out target/test-graph/affected
+            UT_CSV="$(cat target/test-graph/affected/ut.csv)"
+            IT_CSV="$(cat target/test-graph/affected/it.csv)"
+          else
+            UT_CSV=""; IT_CSV=""
+          fi
+          {
+            echo "ut_csv<<EOF"; echo "$UT_CSV"; echo "EOF"
+            echo "it_csv<<EOF"; echo "$IT_CSV"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- 3. run only the affected tests (with module-suite fallback) ----
+      - name: Run affected tests
+        run: |
+          UT_CSV="${{ steps.affected.outputs.ut_csv }}"
+          IT_CSV="${{ steps.affected.outputs.it_csv }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          if [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then
+            echo "Running UT $UT_CSV + IT $IT_CSV"
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DfailIfNoTests=false \
+              -Dtest="$UT_CSV" -DskipIntegrationTests=false -Dit.test="$IT_CSV"
+          elif [ -n "$UT_CSV" ]; then
+            echo "Running UT $UT_CSV"
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DfailIfNoTests=false \
+              -Dtest="$UT_CSV" -DskipIntegrationTests=true
+          elif [ -n "$IT_CSV" ]; then
+            echo "Running IT $IT_CSV"
+            mvn -B -V install -P-assembly -DskipIntegrationTests=false -DfailIfNoTests=false \
+              -Dit.test="$IT_CSV" -DskipUnitTests=true
+          else
+            # Fallback: run the full test suite of the touched modules.
+            MODULES=$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA" \
+                        | cut -d/ -f1 | grep '^dspace' | sort -u | paste -sd, -)
+            if [ -z "$MODULES" ]; then
+              echo "Nothing to test (no source/config changes)."
+              exit 0
+            fi
+            echo "Falling back to full suites of modules: $MODULES"
+            mvn -B -V install -P-assembly -pl "$MODULES" -am \
+              -DskipUnitTests=false -DskipIntegrationTests=true -DfailIfNoTests=false
+          fi
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Test Affected (PR)"
+            echo ""
+            echo "Unit tests: \`${{ steps.affected.outputs.ut_csv }}\`"
+            echo "Integration tests: \`${{ steps.affected.outputs.it_csv }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload affected-test list
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: affected-tests
+          path: target/test-graph/affected
+          retention-days: 14
