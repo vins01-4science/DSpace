@@ -12,6 +12,8 @@ pick() { # glob prefix -> newest matching jar
 
 JACOCO_CORE="$(pick "$M2/org/jacoco/org.jacoco.core" 'org.jacoco.core-*.jar')"
 ASM="$(pick "$M2/org/ow2/asm/asm" 'asm-*.jar')"
+ASM_TREE="$(pick "$M2/org/ow2/asm/asm-tree" 'asm-tree-*.jar')"
+ASM_COMMONS="$(pick "$M2/org/ow2/asm/asm-commons" 'asm-commons-*.jar')"
 SQLITE="$(pick "$M2/org/xerial/sqlite-jdbc" 'sqlite-jdbc-*.jar')"
 
 if [ -z "$JACOCO_CORE" ] || [ -z "$ASM" ] || [ -z "$SQLITE" ]; then
@@ -19,7 +21,10 @@ if [ -z "$JACOCO_CORE" ] || [ -z "$ASM" ] || [ -z "$SQLITE" ]; then
   exit 1
 fi
 
-CP="$JACOCO_CORE:$ASM:$SQLITE"
+CP="$JACOCO_CORE:$ASM"
+[ -n "$ASM_TREE" ] && CP="$CP:$ASM_TREE"
+[ -n "$ASM_COMMONS" ] && CP="$CP:$ASM_COMMONS"
+CP="$CP:$SQLITE"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 exec java --class-path "$CP" "$DIR/TestGraph.java" "$@"

@@ -28,6 +28,12 @@ import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.jacoco.core.analysis.Analyzer;
+import org.jacoco.core.analysis.ICoverageVisitor;
+import org.jacoco.core.analysis.IClassCoverage;
+import org.jacoco.core.analysis.IMethodCoverage;
+import org.jacoco.core.analysis.ICounter;
+import org.jacoco.core.analysis.ILine;
 import org.jacoco.core.tools.ExecFileLoader;
 import org.jacoco.core.data.ExecutionData;
 import org.jacoco.core.data.ExecutionDataStore;
@@ -755,6 +761,179 @@ public class TestGraph {
         }
     }
 
+    // ----------------------------------------------------------------- refine
+
+    /**
+     * Method-level refinement: narrows class-level impact to the tests that actually
+     * cover the changed lines/methods (from a git diff) using per-test JaCoCo line
+     * coverage. Requires the module's per-test exec dir and compiled classes.
+     */
+    private static void refineCmd(Map<String, String> opts) throws Exception {
+        Path db = Paths.get(require(opts, "db"));
+        Path perTest = Paths.get(require(opts, "per-test"));
+        Path classesDir = Paths.get(require(opts, "classes"));
+
+        List<String> diffLines = null;
+        if (opts.containsKey("diff")) {
+            String d = opts.get("diff");
+            if (d.equals("-")) {
+                diffLines = Files.readAllLines(Paths.get("/dev/stdin"), StandardCharsets.UTF_8);
+            } else {
+                diffLines = Files.readAllLines(Paths.get(d), StandardCharsets.UTF_8);
+            }
+        } else if (opts.containsKey("base")) {
+            diffLines = gitDiff(opts.get("base"), opts.getOrDefault("head", "HEAD"));
+        } else {
+            System.err.println("refine requires --diff <file|-> or --base <ref> [--head <ref>]");
+            System.exit(2);
+        }
+
+        Map<String, Set<Integer>> changed = parseDiff(diffLines);
+        if (changed.isEmpty()) {
+            System.out.println("refine: no changed .java files detected in diff");
+            return;
+        }
+
+        Class.forName("org.sqlite.JDBC");
+        Set<String> candidates = new TreeSet<>();
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+            try (PreparedStatement ps = c.prepareStatement("SELECT test FROM impact WHERE class = ?")) {
+                for (String fqcn : changed.keySet()) {
+                    ps.setString(1, topLevel(fqcn));
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) candidates.add(rs.getString(1));
+                    }
+                }
+            }
+        }
+
+        Set<String> inScope = new TreeSet<>();
+        Map<String, Set<String>> touchedMethods = new HashMap<>();
+        for (String test : candidates) {
+            boolean hit = false;
+            for (String fqcn : changed.keySet()) {
+                RefineHit rh = coversChangedLines(perTest, classesDir, test, topLevel(fqcn), changed.get(fqcn));
+                if (rh.hit) {
+                    hit = true;
+                    if (!rh.methods.isEmpty()) {
+                        touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(rh.methods);
+                    }
+                }
+            }
+            if (hit) inScope.add(test);
+        }
+
+        System.out.println("refine: " + candidates.size() + " tests at class-level impact, "
+                + inScope.size() + " tests actually cover changed lines/methods");
+        System.out.println("Changed classes: " + changed.keySet());
+        System.out.println("Tests to re-run (" + inScope.size() + "):");
+        if (inScope.isEmpty()) System.out.println("  (none)");
+        else for (String t : inScope) {
+            Set<String> m = touchedMethods.get(t);
+            System.out.println("  " + t + (m != null && !m.isEmpty() ? "  -> " + m : ""));
+        }
+    }
+
+    private static final class RefineHit {
+        boolean hit;
+        Set<String> methods = new TreeSet<>();
+    }
+
+    private static RefineHit coversChangedLines(Path perTest, Path classesDir,
+                                                String test, String fqcn, Set<Integer> changedLines) throws IOException {
+        RefineHit rh = new RefineHit();
+        Path exec = perTest.resolve(test + ".exec");
+        if (!Files.exists(exec) || Files.size(exec) == 0) return rh;
+        Path classFile = classesDir.resolve(fqcn.replace('.', File.separatorChar) + ".class");
+        if (!Files.exists(classFile)) return rh;
+        try {
+            byte[] bytes = Files.readAllBytes(classFile);
+            String internalName = new ClassReader(bytes).getClassName();
+            ExecFileLoader loader = new ExecFileLoader();
+            loader.load(exec.toFile());
+            ExecutionDataStore dataStore = loader.getExecutionDataStore();
+            ICoverageVisitor visitor = cov -> {
+                if (!cov.getName().equals(internalName)) return;
+                for (IMethodCoverage m : cov.getMethods()) {
+                    int a = m.getFirstLine(), b = m.getLastLine();
+                    if (a < 0 || b < 0) continue;
+                    boolean changed = false, covered = false;
+                    for (int l = a; l <= b; l++) {
+                        if (!changedLines.contains(l)) continue;
+                        changed = true;
+                        ILine ctr = m.getLine(l);
+                        if (ctr != null && ctr.getStatus() != ICounter.EMPTY) covered = true;
+                    }
+                    if (changed && covered) {
+                        rh.hit = true;
+                        rh.methods.add(m.getName());
+                    }
+                }
+            };
+            Analyzer analyzer = new Analyzer(dataStore, visitor);
+            analyzer.analyzeClass(bytes, internalName);
+        } catch (Exception ignored) {
+            // cannot analyze this class/test; treat as not covering
+        }
+        return rh;
+    }
+
+    private static List<String> gitDiff(String base, String head) throws Exception {
+        List<String> out = new ArrayList<>();
+        ProcessBuilder pb = new ProcessBuilder("git", "diff", "--no-color", base, head);
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        try (var r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) out.add(line);
+        }
+        p.waitFor();
+        return out;
+    }
+
+    private static Map<String, Set<Integer>> parseDiff(List<String> lines) {
+        Map<String, Set<Integer>> changed = new HashMap<>();
+        String cur = null;
+        Pattern hunk = Pattern.compile("^@@ -\\d+(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@");
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.startsWith("+++ ")) {
+                String p = line.substring(4).strip();
+                if (p.equals("/dev/null")) { cur = null; continue; }
+                if (p.startsWith("b/")) p = p.substring(2);
+                cur = p;
+            } else if (line.startsWith("@@")) {
+                if (cur == null) continue;
+                Matcher m = hunk.matcher(line);
+                if (!m.find()) continue;
+                int newLine = Integer.parseInt(m.group(1));
+                int j = i + 1;
+                while (j < lines.size()) {
+                    String b = lines.get(j);
+                    if (b.startsWith("@@") || b.startsWith("+++ ") || b.startsWith("--- ")) break;
+                    if (b.startsWith("+") && !b.startsWith("+++")) {
+                        changed.computeIfAbsent(cur, k -> new HashSet<>()).add(newLine);
+                        newLine++;
+                    } else if (b.startsWith("-")) {
+                        // old line only
+                    } else {
+                        newLine++; // context line
+                    }
+                    j++;
+                }
+                i = j - 1;
+            }
+        }
+        // keep only .java files mapped to an fqcn
+        Map<String, Set<Integer>> javaChanged = new HashMap<>();
+        for (Map.Entry<String, Set<Integer>> e : changed.entrySet()) {
+            String fqcn = pathToFqcn(e.getKey());
+            if (fqcn != null) javaChanged.put(fqcn, e.getValue());
+        }
+        return javaChanged;
+    }
+
     // -------------------------------------------------------------- aggregate
 
     private static void aggregateCmd(Map<String, String> opts) throws Exception {
@@ -1029,6 +1208,7 @@ public class TestGraph {
         System.out.println("  build       --module <dir> [--per-test dir] [--edges file] [--config dir] [--db file]");
         System.out.println("  impacted    --db <file> (--file <src|fqcn> | --property <key> |");
         System.out.println("                          --configfile <path> | --bean <type|id> | --beanfile <path>)");
+        System.out.println("  refine      --db <file> --per-test <dir> --classes <dir> (--diff <file|-> | --base <ref> [--head <ref>])");
         System.out.println("  validate    --module <dir> [--per-test dir] [--db file]");
         System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...]");
     }
@@ -1049,6 +1229,7 @@ public class TestGraph {
             case "static":   staticCmd(opts); break;
             case "config":   configCmd(opts); break;
             case "build":    buildCmd(opts); break;
+            case "refine":   refineCmd(opts); break;
             case "impacted": impactedCmd(opts); break;
             case "validate": validateCmd(opts); break;
             case "aggregate": aggregateCmd(opts); break;
