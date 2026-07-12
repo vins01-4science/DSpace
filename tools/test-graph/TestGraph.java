@@ -7,6 +7,7 @@
  */
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -24,6 +25,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.jacoco.core.tools.ExecFileLoader;
 import org.jacoco.core.data.ExecutionData;
@@ -42,29 +45,14 @@ import org.objectweb.asm.Type;
  * <p>Commands:
  * <ul>
  *   <li>{@code static}   - extract DSpace-only static reference edges via ASM</li>
- *   <li>{@code build}    - combine per-test .exec coverage + static edges into an impact index (SQLite)</li>
- *   <li>{@code impacted} - given a changed source file, list the tests to re-run</li>
+ *   <li>{@code config}   - extract property/bean references + config/bean declarations</li>
+ *   <li>{@code build}    - combine per-test .exec coverage + static edges + config into an impact index (SQLite)</li>
+ *   <li>{@code impacted} - given a changed source file / property / config / bean, list the tests to re-run</li>
  *   <li>{@code validate} - sanity-check the generated graph</li>
+ *   <li>{@code aggregate}- merge per-module indexes into a single repo-wide index</li>
  * </ul>
  */
 public class TestGraph {
-
-    public static void main(String[] args) throws Exception {
-        if (args.length < 1) {
-            usage();
-            System.exit(2);
-        }
-        Map<String, String> opts = parseArgs(args, 1);
-        switch (args[0]) {
-            case "static":   staticCmd(opts); break;
-            case "build":    buildCmd(opts); break;
-            case "impacted": impactedCmd(opts); break;
-            case "validate": validateCmd(opts); break;
-            default:
-                usage();
-                System.exit(2);
-        }
-    }
 
     // ---------------------------------------------------------------- static
 
@@ -98,7 +86,6 @@ public class TestGraph {
         try (var stream = Files.walk(root)) {
             stream.filter(p -> p.toString().endsWith(".class")).forEach(p -> {
                 String fqcn = classFileToFqcn(p, root);
-                // keep top-level class only (drop inner classes for the node set)
                 int dollar = fqcn.indexOf('$');
                 out.add(dollar >= 0 ? fqcn.substring(0, dollar) : fqcn);
             });
@@ -229,6 +216,204 @@ public class TestGraph {
         if (t.getSort() == Type.OBJECT) refs.add(new Ref(t.getInternalName(), "uses"));
     }
 
+    // ----------------------------------------------------------------- config
+
+    private static final Pattern RE_GETPROP =
+            Pattern.compile("getProperty[A-Za-z]*\\(\\s*\"([^\"]+)\"");
+    private static final Pattern RE_VALUE =
+            Pattern.compile("@Value\\(\\s*\"\\$\\{([^}:]+)(?::[^}]*)?\\}\"");
+    private static final Pattern RE_CFGPROPS =
+            Pattern.compile("@ConfigurationProperties\\(\\s*(?:prefix\\s*=\\s*)?\"([^\"]+)\"");
+    private static final Pattern RE_GETBEAN_CLASS =
+            Pattern.compile("getBean\\(\\s*([\\w.$]+)\\.class\\s*\\)");
+    private static final Pattern RE_GETBEAN_NAME =
+            Pattern.compile("getBean\\(\\s*\"([^\"]+)\"");
+    private static final Pattern RE_RESNAME =
+            Pattern.compile("@Resource\\(\\s*name\\s*=\\s*\"([^\"]+)\"");
+    private static final Pattern RE_INJ =
+            Pattern.compile("@(Autowired|Resource|Inject)\\b");
+    private static final Pattern RE_BEAN =
+            Pattern.compile("@Bean\\b");
+    private static final Pattern RE_TYPE_TOKEN =
+            Pattern.compile("([A-Z][\\w]*(?:\\.[A-Z][\\w]*)*(?:<[^>]*>)?)");
+    private static final Pattern RE_METHOD_RET =
+            Pattern.compile("(\\b[A-Z][\\w.<>\\[\\],\\s]*?)\\s+\\w+\\s*\\(");
+
+    private static void configCmd(Map<String, String> opts) throws IOException {
+        Path module = Paths.get(require(opts, "module"));
+        Path outDir = Paths.get(opts.getOrDefault("out",
+                module.resolve("target/test-graph").toString()));
+        Files.createDirectories(outDir);
+
+        List<String[]> propRefs = new ArrayList<>();
+        List<String[]> beanRefs = new ArrayList<>();
+        List<String[]> configKeys = new ArrayList<>();
+        List<String[]> beanDecls = new ArrayList<>();
+
+        // Java sources: property + bean references
+        for (Path root : new Path[]{module.resolve("src/main/java"), module.resolve("src/test/java")}) {
+            if (!Files.exists(root)) continue;
+            try (var stream = Files.walk(root)) {
+                for (Path f : stream.filter(p -> p.toString().endsWith(".java")).toList()) {
+                    String from = javaSourceToFqcn(f);
+                    if (from == null) continue;
+                    String src = Files.readString(f, StandardCharsets.UTF_8);
+                    extractJavaConfigRefs(from, src, propRefs, beanRefs, beanDecls);
+                }
+            }
+        }
+
+        // Resources: config keys (properties/cfg/yml) + bean declarations (XML)
+        for (Path root : new Path[]{module.resolve("src/main/resources"), module.resolve("src/test/resources")}) {
+            if (!Files.exists(root)) continue;
+            try (var stream = Files.walk(root)) {
+                for (Path f : stream.filter(p -> {
+                    String n = p.toString();
+                    return n.endsWith(".properties") || n.endsWith(".cfg")
+                            || n.endsWith(".yml") || n.endsWith(".yaml")
+                            || n.endsWith(".xml");
+                }).toList()) {
+                    String rel = f.toString();
+                    if (rel.endsWith(".xml")) {
+                        extractXmlConfig(f, configKeys, beanDecls);
+                    } else {
+                        extractPropertiesConfig(f, configKeys);
+                    }
+                }
+            }
+        }
+
+        // Optional repo-wide config scan (cross-module properties / XML beans)
+        String root = opts.get("root");
+        if (root != null) {
+            Path repo = Paths.get(root);
+            try (var stream = Files.walk(repo)) {
+                for (Path f : stream.filter(p -> {
+                    String n = p.toString();
+                    return (n.endsWith(".properties") || n.endsWith(".cfg")
+                            || n.endsWith(".yml") || n.endsWith(".yaml")
+                            || n.endsWith(".xml"))
+                            && n.contains("config");
+                }).toList()) {
+                    if (f.toString().endsWith(".xml")) {
+                        extractXmlConfig(f, configKeys, beanDecls);
+                    } else {
+                        extractPropertiesConfig(f, configKeys);
+                    }
+                }
+            }
+        }
+
+        writeTsv(outDir.resolve("property_refs.tsv"), propRefs);
+        writeTsv(outDir.resolve("bean_refs.tsv"), beanRefs);
+        writeTsv(outDir.resolve("config_keys.tsv"), configKeys);
+        writeTsv(outDir.resolve("bean_decls.tsv"), beanDecls);
+        System.out.println("config: " + propRefs.size() + " property refs, " + beanRefs.size()
+                + " bean refs, " + configKeys.size() + " config keys, " + beanDecls.size()
+                + " bean decls -> " + outDir);
+    }
+
+    private static void extractJavaConfigRefs(String from, String src,
+                                              List<String[]> propRefs,
+                                              List<String[]> beanRefs,
+                                              List<String[]> beanDecls) {
+        for (Matcher m = RE_GETPROP.matcher(src); m.find();) {
+            propRefs.add(new String[]{from, m.group(1), "cfg-read"});
+        }
+        for (Matcher m = RE_VALUE.matcher(src); m.find();) {
+            propRefs.add(new String[]{from, m.group(1), "value"});
+        }
+        for (Matcher m = RE_CFGPROPS.matcher(src); m.find();) {
+            propRefs.add(new String[]{from, m.group(1), "config-props"});
+        }
+        for (Matcher m = RE_GETBEAN_CLASS.matcher(src); m.find();) {
+            beanRefs.add(new String[]{from, m.group(1), "bean-consumer-type"});
+        }
+        for (Matcher m = RE_GETBEAN_NAME.matcher(src); m.find();) {
+            beanRefs.add(new String[]{from, m.group(1), "bean-consumer-name"});
+        }
+        for (Matcher m = RE_RESNAME.matcher(src); m.find();) {
+            beanRefs.add(new String[]{from, m.group(1), "bean-consumer-name"});
+        }
+        // @Autowired / @Resource / @Inject -> following type token(s)
+        Matcher inj = RE_INJ.matcher(src);
+        while (inj.find()) {
+            int pos = inj.end();
+            String around = src.substring(pos, Math.min(pos + 400, src.length()));
+            Matcher t = RE_TYPE_TOKEN.matcher(around);
+            if (t.find()) {
+                beanRefs.add(new String[]{from, t.group(1), "bean-consumer-type"});
+            }
+        }
+        // @Bean -> preceding method return type (declaration)
+        Matcher bean = RE_BEAN.matcher(src);
+        while (bean.find()) {
+            int start = bean.start();
+            String before = src.substring(Math.max(0, start - 400), start);
+            Matcher r = RE_METHOD_RET.matcher(before);
+            String ret = null;
+            while (r.find()) ret = r.group(1).trim();
+            if (ret != null && !ret.isEmpty()) {
+                beanDecls.add(new String[]{from, ret, ""});
+            }
+        }
+    }
+
+    private static void extractPropertiesConfig(Path file, List<String[]> configKeys) throws IOException {
+        String fp = file.toString();
+        try (var lines = Files.lines(file, StandardCharsets.UTF_8)) {
+            boolean inMultiline = false;
+            for (String raw : (Iterable<String>) lines::iterator) {
+                String line = raw.trim();
+                if (line.isEmpty() || line.startsWith("#") || line.startsWith("!")) continue;
+                if (inMultiline && !line.endsWith("\\")) inMultiline = false;
+                int eq = line.indexOf('=');
+                int colon = line.indexOf(':');
+                int split = -1;
+                if (eq >= 0 && colon >= 0) split = Math.min(eq, colon);
+                else if (eq >= 0) split = eq;
+                else if (colon >= 0) split = colon;
+                if (split < 0) {
+                    if (line.endsWith("\\")) inMultiline = true;
+                    continue;
+                }
+                String key = line.substring(0, split).trim();
+                if (key.isEmpty()) continue;
+                configKeys.add(new String[]{fp, key});
+                if (line.endsWith("\\")) inMultiline = true;
+            }
+        }
+        // file sentinel so --configfile returns tests touching the file itself
+        configKeys.add(new String[]{fp, fp});
+    }
+
+    private static void extractXmlConfig(Path file, List<String[]> configKeys,
+                                         List<String[]> beanDecls) throws IOException {
+        String fp = file.toString();
+        String text = Files.readString(file, StandardCharsets.UTF_8);
+        // Spring bean declarations
+        Matcher bean = Pattern.compile("<bean\\b[^>]*").matcher(text);
+        while (bean.find()) {
+            String tag = bean.group(0);
+            String id = attr(tag, "id");
+            String type = attr(tag, "class");
+            if (type != null) {
+                beanDecls.add(new String[]{fp, type, id == null ? "" : id});
+            }
+        }
+        // metadata XML: id / name attributes as pseudo-keys
+        Matcher attr = Pattern.compile("\\b(?:id|name)\\s*=\\s*\"([^\"]+)\"").matcher(text);
+        while (attr.find()) {
+            configKeys.add(new String[]{fp, attr.group(1)});
+        }
+        configKeys.add(new String[]{fp, fp});
+    }
+
+    private static String attr(String tag, String name) {
+        Matcher m = Pattern.compile(name + "\\s*=\\s*\"([^\"]*)\"").matcher(tag);
+        return m.find() ? m.group(1) : null;
+    }
+
     // ------------------------------------------------------------------ build
 
     private static void buildCmd(Map<String, String> opts) throws Exception {
@@ -237,6 +422,8 @@ public class TestGraph {
                 module.resolve("target/per-test").toString()));
         Path edgesFile = Paths.get(opts.getOrDefault("edges",
                 module.resolve("target/test-graph/edges.tsv").toString()));
+        Path configDir = Paths.get(opts.getOrDefault("config",
+                module.resolve("target/test-graph").toString()));
         Path db = Paths.get(opts.getOrDefault("db",
                 module.resolve("target/test-graph/impact-index.sqlite").toString()));
         Files.createDirectories(db.getParent());
@@ -272,7 +459,38 @@ public class TestGraph {
             }
         }
 
-        // 3) reverse impact closure: class -> tests whose covered set reaches it
+        // 3) config: property/bean refs + config/bean declarations
+        List<String[]> propRefs = readTsv(configDir.resolve("property_refs.tsv"));
+        List<String[]> beanRefs = readTsv(configDir.resolve("bean_refs.tsv"));
+        List<String[]> configKeys = readTsv(configDir.resolve("config_keys.tsv"));
+        List<String[]> beanDecls = readTsv(configDir.resolve("bean_decls.tsv"));
+
+        // known class universe for folding bean edges
+        Set<String> known = new HashSet<>();
+        known.addAll(refs.keySet());
+        refs.values().forEach(known::addAll);
+        known.addAll(covered.keySet());
+
+        // fold bean consumer edges (consumer -> bean type) so bean changes impact consumers
+        Map<String, String> idToType = new HashMap<>();
+        for (String[] d : beanDecls) {
+            if (d.length >= 3 && !d[2].isEmpty()) idToType.put(d[2], d[1]);
+        }
+        for (String[] b : beanRefs) {
+            String from = b[0], ref = b[1], kind = b[2];
+            if (kind.equals("bean-consumer-type") || kind.equals("bean-decl-type")) {
+                String t = topLevel(ref);
+                if (known.contains(t)) refs.computeIfAbsent(from, k -> new HashSet<>()).add(t);
+            } else if (kind.equals("bean-consumer-name")) {
+                String t = idToType.get(ref);
+                if (t != null) {
+                    t = topLevel(t);
+                    if (known.contains(t)) refs.computeIfAbsent(from, k -> new HashSet<>()).add(t);
+                }
+            }
+        }
+
+        // 4) reverse impact closure: class -> tests whose covered set reaches it
         Map<String, Set<String>> impact = new HashMap<>();
         for (Map.Entry<String, Set<String>> e : covered.entrySet()) {
             String test = e.getKey();
@@ -293,19 +511,39 @@ public class TestGraph {
             }
         }
 
-        // 4) write SQLite
+        // 5) property_impact: key -> tests (via property_refs -> class -> tests)
+        Map<String, Set<String>> propImpact = new HashMap<>();
+        for (String[] pr : propRefs) {
+            String cls = topLevel(pr[0]);
+            Set<String> tests = impact.get(cls);
+            if (tests != null) {
+                propImpact.computeIfAbsent(pr[1], k -> new HashSet<>()).addAll(tests);
+            }
+        }
+
+        // 6) write SQLite
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             c.setAutoCommit(false);
-            c.createStatement().execute("DROP TABLE IF EXISTS class_refs");
-            c.createStatement().execute("DROP TABLE IF EXISTS test_covers");
-            c.createStatement().execute("DROP TABLE IF EXISTS impact");
+            String[] drops = {"class_refs", "test_covers", "impact",
+                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact"};
+            for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
             c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
             c.createStatement().execute("CREATE TABLE test_covers(test TEXT, class TEXT)");
             c.createStatement().execute("CREATE TABLE impact(class TEXT, test TEXT)");
+            c.createStatement().execute("CREATE TABLE property_refs(from_c TEXT, key TEXT, kind TEXT)");
+            c.createStatement().execute("CREATE TABLE bean_refs(from_c TEXT, ref TEXT, kind TEXT)");
+            c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
+            c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
+            c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
             try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
                  PreparedStatement ps2 = c.prepareStatement("INSERT INTO test_covers VALUES (?,?)");
-                 PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)")) {
+                 PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)");
+                 PreparedStatement ps4 = c.prepareStatement("INSERT INTO property_refs VALUES (?,?,?)");
+                 PreparedStatement ps5 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
+                 PreparedStatement ps6 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
+                 PreparedStatement ps7 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
+                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)")) {
                 for (Map.Entry<String, Set<String>> e : refs.entrySet()) {
                     for (String to : e.getValue()) {
                         ps1.setString(1, e.getKey());
@@ -328,44 +566,299 @@ public class TestGraph {
                         ps3.addBatch();
                     }
                 }
-                ps1.executeBatch();
-                ps2.executeBatch();
-                ps3.executeBatch();
+                for (String[] r : propRefs) {
+                    ps4.setString(1, r[0]); ps4.setString(2, r[1]); ps4.setString(3, r[2]); ps4.addBatch();
+                }
+                for (String[] r : beanRefs) {
+                    ps5.setString(1, r[0]); ps5.setString(2, r[1]); ps5.setString(3, r[2]); ps5.addBatch();
+                }
+                for (String[] r : configKeys) {
+                    ps6.setString(1, r[0]); ps6.setString(2, r[1]); ps6.addBatch();
+                }
+                for (String[] r : beanDecls) {
+                    ps7.setString(1, r[0]); ps7.setString(2, r[1]);
+                    ps7.setString(3, r.length > 2 ? r[2] : ""); ps7.addBatch();
+                }
+                for (Map.Entry<String, Set<String>> e : propImpact.entrySet()) {
+                    for (String test : e.getValue()) {
+                        ps8.setString(1, e.getKey());
+                        ps8.setString(2, test);
+                        ps8.addBatch();
+                    }
+                }
+                ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
+                ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
+                ps7.executeBatch(); ps8.executeBatch();
             }
             c.commit();
         }
         System.out.println("build: " + covered.size() + " tests, " + refs.size()
-                + " classes-in-graph, " + impact.size() + " impacted classes -> " + db);
+                + " classes-in-graph, " + impact.size() + " impacted classes, "
+                + propImpact.size() + " impacted properties -> " + db);
+    }
+
+    private static String topLevel(String fqcn) {
+        int d = fqcn.indexOf('$');
+        if (d >= 0) fqcn = fqcn.substring(0, d);
+        // strip generics
+        int g = fqcn.indexOf('<');
+        if (g >= 0) fqcn = fqcn.substring(0, g);
+        return fqcn;
     }
 
     // --------------------------------------------------------------- impacted
 
     private static void impactedCmd(Map<String, String> opts) throws Exception {
         Path db = Paths.get(require(opts, "db"));
-        String file = require(opts, "file");
-        String fqcn = pathToFqcn(file);
-        if (fqcn == null) {
-            System.err.println("Cannot resolve '" + file + "' to a class. Pass a source path under "
-                    + "src/main/java or src/test/java, or the fully-qualified class name.");
-            System.exit(1);
-        }
+
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
-            System.out.println("Changed class: " + fqcn);
-            try (PreparedStatement ps = c.prepareStatement(
-                    "SELECT test FROM impact WHERE class = ? ORDER BY test")) {
-                ps.setString(1, fqcn);
-                try (ResultSet rs = ps.executeQuery()) {
-                    boolean any = false;
-                    System.out.println("Tests to re-run:");
-                    while (rs.next()) {
-                        any = true;
-                        System.out.println("  " + rs.getString(1));
+            if (opts.containsKey("property")) {
+                String key = opts.get("property");
+                queryTests(c, "SELECT test FROM property_impact WHERE key = ? ORDER BY test",
+                        key, "Property: " + key);
+            } else if (opts.containsKey("configfile")) {
+                String path = opts.get("configfile");
+                Set<String> keys = fileKeys(c, path);
+                System.out.println("Config file: " + path);
+                if (keys.isEmpty()) { System.out.println("  (no keys / not indexed)"); return; }
+                Set<String> tests = new TreeSet<>();
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT test FROM property_impact WHERE key = ?")) {
+                    for (String k : keys) {
+                        ps.setString(1, k);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) tests.add(rs.getString(1));
+                        }
                     }
-                    if (!any) System.out.println("  (none)");
+                }
+                System.out.println("Tests to re-run (" + tests.size() + "):");
+                if (tests.isEmpty()) System.out.println("  (none)");
+                else tests.forEach(t -> System.out.println("  " + t));
+            } else if (opts.containsKey("bean")) {
+                String bean = opts.get("bean");
+                String type = bean.contains(".") ? topLevel(bean) : null;
+                Set<String> types = new TreeSet<>();
+                if (type != null) {
+                    types.add(type);
+                } else {
+                    // resolve bean id -> declared types
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "SELECT bean_type FROM bean_decls WHERE bean_id = ?")) {
+                        ps.setString(1, bean);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) types.add(topLevel(rs.getString(1)));
+                        }
+                    }
+                }
+                System.out.println("Bean: " + bean + (type == null ? " (id)" : " (type)"));
+                if (types.isEmpty()) { System.out.println("  (no matching bean type)"); return; }
+                Set<String> tests = new TreeSet<>();
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT test FROM impact WHERE class = ?")) {
+                    for (String t : types) {
+                        ps.setString(1, t);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) tests.add(rs.getString(1));
+                        }
+                    }
+                }
+                System.out.println("Tests to re-run (" + tests.size() + "):");
+                if (tests.isEmpty()) System.out.println("  (none)");
+                else tests.forEach(t -> System.out.println("  " + t));
+            } else if (opts.containsKey("beanfile")) {
+                String path = opts.get("beanfile");
+                Set<String> types = new TreeSet<>();
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT bean_type FROM bean_decls WHERE " + fileMatchSql(path))) {
+                    setFileParam(ps, path);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) types.add(topLevel(rs.getString(1)));
+                    }
+                }
+                System.out.println("Bean file: " + path);
+                if (types.isEmpty()) { System.out.println("  (no bean declarations indexed)"); return; }
+                Set<String> tests = new TreeSet<>();
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT test FROM impact WHERE class = ?")) {
+                    for (String t : types) {
+                        ps.setString(1, t);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) tests.add(rs.getString(1));
+                        }
+                    }
+                }
+                System.out.println("Tests to re-run (" + tests.size() + "):");
+                if (tests.isEmpty()) System.out.println("  (none)");
+                else tests.forEach(t -> System.out.println("  " + t));
+            } else {
+                String file = require(opts, "file");
+                String fqcn = pathToFqcn(file);
+                if (fqcn == null) {
+                    System.err.println("Cannot resolve '" + file + "' to a class. Pass a source path under "
+                            + "src/main/java or src/test/java, or the fully-qualified class name.");
+                    System.exit(1);
+                }
+                System.out.println("Changed class: " + fqcn);
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT test FROM impact WHERE class = ? ORDER BY test")) {
+                    ps.setString(1, fqcn);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        boolean any = false;
+                        System.out.println("Tests to re-run:");
+                        while (rs.next()) {
+                            any = true;
+                            System.out.println("  " + rs.getString(1));
+                        }
+                        if (!any) System.out.println("  (none)");
+                    }
                 }
             }
         }
+    }
+
+    private static Set<String> fileKeys(Connection c, String path) throws Exception {
+        Set<String> keys = new TreeSet<>();
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT key FROM config_keys WHERE " + fileMatchSql(path))) {
+            setFileParam(ps, path);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) keys.add(rs.getString(1));
+            }
+        }
+        return keys;
+    }
+
+    private static String fileMatchSql(String path) {
+        return "file = ? OR file LIKE ?";
+    }
+
+    private static void setFileParam(PreparedStatement ps, String path) throws Exception {
+        Path p = Paths.get(path).toAbsolutePath().normalize();
+        ps.setString(1, p.toString());
+        ps.setString(2, "%" + File.separator + p.getFileName().toString());
+    }
+
+    private static void queryTests(Connection c, String sql, String param, String label) throws Exception {
+        System.out.println(label);
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, param);
+            try (ResultSet rs = ps.executeQuery()) {
+                boolean any = false;
+                System.out.println("Tests to re-run:");
+                while (rs.next()) {
+                    any = true;
+                    System.out.println("  " + rs.getString(1));
+                }
+                if (!any) System.out.println("  (none)");
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- aggregate
+
+    private static void aggregateCmd(Map<String, String> opts) throws Exception {
+        List<Path> dbs = new ArrayList<>();
+        for (Map.Entry<String, String> e : opts.entrySet()) {
+            if (e.getKey().equals("db") || e.getKey().matches("db[2-9]|db[1-9][0-9]+")) {
+                dbs.add(Paths.get(e.getValue()));
+            }
+        }
+        if (dbs.isEmpty()) dbs.add(Paths.get(require(opts, "db")));
+        Path out = Paths.get(require(opts, "out"));
+        Files.createDirectories(out.getParent());
+
+        Map<String, Set<String>> impact = new HashMap<>();
+        Map<String, Set<String>> covers = new HashMap<>();
+        Map<String, Set<String>> refs = new HashMap<>();
+        List<String[]> propRefs = new ArrayList<>();
+        List<String[]> beanRefs = new ArrayList<>();
+        List<String[]> configKeys = new ArrayList<>();
+        List<String[]> beanDecls = new ArrayList<>();
+
+        Class.forName("org.sqlite.JDBC");
+        for (Path db : dbs) {
+            try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+                mergeMap(c, "SELECT class, test FROM impact", impact);
+                mergeMap(c, "SELECT test, class FROM test_covers", covers);
+                mergeMap(c, "SELECT from_c, to_c FROM class_refs", refs);
+                propRefs.addAll(readDb(c, "SELECT from_c, key, kind FROM property_refs"));
+                beanRefs.addAll(readDb(c, "SELECT from_c, ref, kind FROM bean_refs"));
+                configKeys.addAll(readDb(c, "SELECT file, key FROM config_keys"));
+                beanDecls.addAll(readDb(c, "SELECT file, bean_type, bean_id FROM bean_decls"));
+            }
+        }
+
+        Map<String, Set<String>> propImpact = new HashMap<>();
+        for (String[] pr : propRefs) {
+            Set<String> tests = impact.get(topLevel(pr[0]));
+            if (tests != null) propImpact.computeIfAbsent(pr[1], k -> new HashSet<>()).addAll(tests);
+        }
+
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out)) {
+            c.setAutoCommit(false);
+            String[] drops = {"class_refs", "test_covers", "impact",
+                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact"};
+            for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
+            c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
+            c.createStatement().execute("CREATE TABLE test_covers(test TEXT, class TEXT)");
+            c.createStatement().execute("CREATE TABLE impact(class TEXT, test TEXT)");
+            c.createStatement().execute("CREATE TABLE property_refs(from_c TEXT, key TEXT, kind TEXT)");
+            c.createStatement().execute("CREATE TABLE bean_refs(from_c TEXT, ref TEXT, kind TEXT)");
+            c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
+            c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
+            c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
+            try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
+                 PreparedStatement ps2 = c.prepareStatement("INSERT INTO test_covers VALUES (?,?)");
+                 PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)");
+                 PreparedStatement ps4 = c.prepareStatement("INSERT INTO property_refs VALUES (?,?,?)");
+                 PreparedStatement ps5 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
+                 PreparedStatement ps6 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
+                 PreparedStatement ps7 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
+                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)")) {
+                for (Map.Entry<String, Set<String>> e : refs.entrySet())
+                    for (String to : e.getValue()) { ps1.setString(1, e.getKey()); ps1.setString(2, to); ps1.setString(3, "reference"); ps1.addBatch(); }
+                for (Map.Entry<String, Set<String>> e : covers.entrySet())
+                    for (String cls : e.getValue()) { ps2.setString(1, e.getKey()); ps2.setString(2, cls); ps2.addBatch(); }
+                for (Map.Entry<String, Set<String>> e : impact.entrySet())
+                    for (String t : e.getValue()) { ps3.setString(1, e.getKey()); ps3.setString(2, t); ps3.addBatch(); }
+                for (String[] r : propRefs) { ps4.setString(1, r[0]); ps4.setString(2, r[1]); ps4.setString(3, r[2]); ps4.addBatch(); }
+                for (String[] r : beanRefs) { ps5.setString(1, r[0]); ps5.setString(2, r[1]); ps5.setString(3, r[2]); ps5.addBatch(); }
+                for (String[] r : configKeys) { ps6.setString(1, r[0]); ps6.setString(2, r[1]); ps6.addBatch(); }
+                for (String[] r : beanDecls) { ps7.setString(1, r[0]); ps7.setString(2, r[1]); ps7.setString(3, r.length > 2 ? r[2] : ""); ps7.addBatch(); }
+                for (Map.Entry<String, Set<String>> e : propImpact.entrySet())
+                    for (String t : e.getValue()) { ps8.setString(1, e.getKey()); ps8.setString(2, t); ps8.addBatch(); }
+                ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
+                ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
+                ps7.executeBatch(); ps8.executeBatch();
+            }
+            c.commit();
+        }
+        System.out.println("aggregate: " + dbs.size() + " module indexes -> " + out
+                + " (" + impact.size() + " impacted classes, " + propImpact.size() + " impacted properties)");
+    }
+
+    private static void mergeMap(Connection c, String sql, Map<String, Set<String>> dst) throws Exception {
+        try (PreparedStatement ps = c.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                dst.computeIfAbsent(rs.getString(1), k -> new HashSet<>()).add(rs.getString(2));
+            }
+        }
+    }
+
+    private static List<String[]> readDb(Connection c, String sql) throws Exception {
+        List<String[]> out = new ArrayList<>();
+        try (PreparedStatement ps = c.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            int n = rs.getMetaData().getColumnCount();
+            while (rs.next()) {
+                String[] row = new String[n];
+                for (int i = 0; i < n; i++) row[i] = rs.getString(i + 1);
+                out.add(row);
+            }
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- validate
@@ -412,8 +905,21 @@ public class TestGraph {
 
             long impacts = count(c, "SELECT COUNT(*) FROM impact");
             long edges = count(c, "SELECT COUNT(*) FROM class_refs");
+            long propRefs = count(c, "SELECT COUNT(*) FROM property_refs");
+            long beanRefs = count(c, "SELECT COUNT(*) FROM bean_refs");
+            long configKeys = count(c, "SELECT COUNT(*) FROM config_keys");
+            long beanDecls = count(c, "SELECT COUNT(*) FROM bean_decls");
+            long propImpacts = count(c, "SELECT COUNT(*) FROM property_impact");
+
+            if (propRefs == 0) fail("property_refs is empty");
+            if (configKeys == 0) fail("config_keys is empty");
+            if (beanDecls == 0) fail("bean_decls is empty");
+
             System.out.println("validate OK: " + execCount + " exec files, " + covers
                     + " test_covers rows, " + edges + " edges, " + impacts + " impact rows");
+            System.out.println("  config: " + propRefs + " property refs, " + beanRefs
+                    + " bean refs, " + configKeys + " config keys, " + beanDecls
+                    + " bean decls, " + propImpacts + " property_impact rows");
         }
     }
 
@@ -436,6 +942,17 @@ public class TestGraph {
         return internal.replace('/', '.');
     }
 
+    private static String javaSourceToFqcn(Path file) {
+        String s = file.toString();
+        String markerMain = "src" + File.separator + "main" + File.separator + "java";
+        String markerTest = "src" + File.separator + "test" + File.separator + "java";
+        int i = s.indexOf(markerMain);
+        if (i >= 0) return toFqcn(s.substring(i + markerMain.length() + 1));
+        int j = s.indexOf(markerTest);
+        if (j >= 0) return toFqcn(s.substring(j + markerTest.length() + 1));
+        return null;
+    }
+
     private static String pathToFqcn(String path) {
         String s = Paths.get(path).toString();
         String markerMain = "src" + File.separator + "main" + File.separator + "java";
@@ -451,6 +968,24 @@ public class TestGraph {
     private static String toFqcn(String rel) {
         if (rel.endsWith(".java")) rel = rel.substring(0, rel.length() - 5);
         return rel.replace(File.separatorChar, '.').replace('/', '.');
+    }
+
+    private static void writeTsv(Path file, List<String[]> rows) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        for (String[] r : rows) {
+            sb.append(String.join("\t", r)).append('\n');
+        }
+        Files.writeString(file, sb.toString());
+    }
+
+    private static List<String[]> readTsv(Path file) throws IOException {
+        List<String[]> rows = new ArrayList<>();
+        if (!Files.exists(file)) return rows;
+        for (String line : Files.readAllLines(file)) {
+            if (line.isEmpty()) continue;
+            rows.add(line.split("\t", -1));
+        }
+        return rows;
     }
 
     private static long sizeOf(Path p) {
@@ -484,15 +1019,37 @@ public class TestGraph {
 
     private static void usage() {
         System.out.println("Usage: java TestGraph.java <cmd> [options]");
-        System.out.println("  static   --module <dir> [--out edges.tsv]");
-        System.out.println("  build    --module <dir> [--per-test dir] [--edges file] [--db file]");
-        System.out.println("  impacted --db <file> --file <source-path-or-fqcn>");
-        System.out.println("  validate --module <dir> [--per-test dir] [--db file]");
+        System.out.println("  static      --module <dir> [--out edges.tsv]");
+        System.out.println("  config      --module <dir> [--out dir] [--root <repo>]");
+        System.out.println("  build       --module <dir> [--per-test dir] [--edges file] [--config dir] [--db file]");
+        System.out.println("  impacted    --db <file> (--file <src|fqcn> | --property <key> |");
+        System.out.println("                          --configfile <path> | --bean <type|id> | --beanfile <path>)");
+        System.out.println("  validate    --module <dir> [--per-test dir] [--db file]");
+        System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...]");
     }
 
     private static final class Ref {
         final String to;
         final String kind;
         Ref(String to, String kind) { this.to = to; this.kind = kind; }
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 1) {
+            usage();
+            System.exit(2);
+        }
+        Map<String, String> opts = parseArgs(args, 1);
+        switch (args[0]) {
+            case "static":   staticCmd(opts); break;
+            case "config":   configCmd(opts); break;
+            case "build":    buildCmd(opts); break;
+            case "impacted": impactedCmd(opts); break;
+            case "validate": validateCmd(opts); break;
+            case "aggregate": aggregateCmd(opts); break;
+            default:
+                usage();
+                System.exit(2);
+        }
     }
 }
