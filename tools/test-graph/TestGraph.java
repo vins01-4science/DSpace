@@ -17,10 +17,12 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -39,6 +41,7 @@ import org.jacoco.core.data.ExecutionData;
 import org.jacoco.core.data.ExecutionDataStore;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.Label;
 import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
@@ -264,6 +267,48 @@ public class TestGraph {
     private static final String[] REGISTRY_CONSUMERS = {
             "org.dspace.administer.MetadataImporter",
             "org.dspace.administer.RegistryLoader"};
+
+    /**
+     * Curated config change -> consumer (class, method) map used by {@code refine --configfile}
+     * for method-level narrowing. A {@code null} method means the whole class is the relevant
+     * code portion (class-level). Keyed by config basename, or {@code "registry"} for any file
+     * under {@code dspace/config/registries/}. This is an extension point: tighten or widen the
+     * method list per config entity to trade precision against recall.
+     */
+    private static final Map<String, List<ClassMethod>> CONFIG_ENTITY_METHODS = new LinkedHashMap<>();
+    static {
+        CONFIG_ENTITY_METHODS.put("submission-forms.xml", new ArrayList<ClassMethod>() {{
+            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "<init>"));
+            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsByFormName"));
+            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsByCollection"));
+            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsBySubmissionName"));
+            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputFormNameByCollectionAndField"));
+            add(new ClassMethod("org.dspace.app.util.DCInput", "getLabel"));
+            add(new ClassMethod("org.dspace.app.util.DCInput", "getElement"));
+            add(new ClassMethod("org.dspace.app.util.DCInput", "getSchema"));
+            add(new ClassMethod("org.dspace.app.util.DCInput", "getQualifier"));
+            add(new ClassMethod("org.dspace.app.util.DCInput", "isRequired"));
+            add(new ClassMethod("org.dspace.content.authority.DCInputAuthority", "getChoiceAuthority"));
+            add(new ClassMethod("org.dspace.app.util.Util", "differenceInSubmissionFields"));
+        }});
+        CONFIG_ENTITY_METHODS.put("item-submission.xml", new ArrayList<ClassMethod>() {{
+            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "<init>"));
+            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByName"));
+            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByCollection"));
+            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getStepConfig"));
+            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByInProgressSubmission"));
+        }});
+        CONFIG_ENTITY_METHODS.put("registry", new ArrayList<ClassMethod>() {{
+            add(new ClassMethod("org.dspace.administer.MetadataImporter", "loadRegistry"));
+            add(new ClassMethod("org.dspace.administer.RegistryLoader", "loadBitstreamFormats"));
+        }});
+    }
+
+    private static final class ClassMethod {
+        final String cls;
+        final String method; // null => whole class is relevant
+        ClassMethod(String cls, String method) { this.cls = cls; this.method = method; }
+    }
 
     private static void collectConfigConsumers(Path f, List<String[]> out) {
         String name = f.getFileName().toString();
@@ -827,10 +872,11 @@ public class TestGraph {
      */
     private static void refineCmd(Map<String, String> opts) throws Exception {
         Path db = Paths.get(require(opts, "db"));
-        Path perTest = Paths.get(require(opts, "per-test"));
-        Path classesDir = Paths.get(require(opts, "classes"));
+        Path perTest = opts.containsKey("per-test") ? Paths.get(opts.get("per-test")) : null;
+        Path classesDir = opts.containsKey("classes") ? Paths.get(opts.get("classes")) : null;
+        boolean haveCoverage = perTest != null && classesDir != null;
 
-        List<String> diffLines = null;
+        List<String> diffLines;
         if (opts.containsKey("diff")) {
             String d = opts.get("diff");
             if (d.equals("-")) {
@@ -840,41 +886,127 @@ public class TestGraph {
             }
         } else if (opts.containsKey("base")) {
             diffLines = gitDiff(opts.get("base"), opts.getOrDefault("head", "HEAD"));
+        } else if (opts.containsKey("configfile")) {
+            // config-only refinement without an explicit diff: treat the config file's own
+            // content as the diff so parseConfigEntities sees all entities -> class-level union.
+            diffLines = Files.readAllLines(Paths.get(opts.get("configfile")), StandardCharsets.UTF_8);
         } else {
-            System.err.println("refine requires --diff <file|-> or --base <ref> [--head <ref>]");
+            System.err.println("refine requires --diff <file|-> or --base <ref> [--head <ref>] (or --configfile for config-only refinement)");
             System.exit(2);
+            return;
         }
 
-        Map<String, Set<Integer>> changed = parseDiff(diffLines);
-        if (changed.isEmpty()) {
-            System.out.println("refine: no changed .java files detected in diff");
+        // .java changes -> method/class line ranges (existing behavior)
+        Map<String, Set<Integer>> javaChanged = parseDiff(diffLines);
+
+        // config XML changes -> consumer method line ranges (item B)
+        Map<String, Set<Integer>> methodLinesMap = new HashMap<>();
+        Set<String> classOnly = new TreeSet<>();
+        if (opts.containsKey("configfile")) {
+            String cfg = opts.get("configfile");
+            Set<String> entities = parseConfigEntities(diffLines, cfg);
+            if (entities.isEmpty()) {
+                // whole-file / unrecognized change -> class-level for all consumers
+                classOnly.addAll(configConsumersFor(cfg));
+            } else {
+                String key = configKeyFor(cfg);
+                List<ClassMethod> cms = key == null ? null : CONFIG_ENTITY_METHODS.get(key);
+                if (cms == null || cms.isEmpty()) {
+                    classOnly.addAll(configConsumersFor(cfg));
+                } else {
+                    for (ClassMethod cm : cms) {
+                        if (cm.method == null || classesDir == null) {
+                            classOnly.add(cm.cls);
+                        } else {
+                            int[] lr = methodLines(classesDir, cm.cls, cm.method);
+                            if (lr == null) classOnly.add(cm.cls);
+                            else methodLinesMap.computeIfAbsent(cm.cls, k -> new TreeSet<>())
+                                    .addAll(linesRange(lr[0], lr[1]));
+                        }
+                    }
+                }
+            }
+        }
+
+        Set<String> candidateClasses = new TreeSet<>();
+        candidateClasses.addAll(javaChanged.keySet());
+        candidateClasses.addAll(methodLinesMap.keySet());
+        candidateClasses.addAll(classOnly);
+        if (candidateClasses.isEmpty()) {
+            System.out.println("refine: no changed .java files or recognized config changes detected in diff");
             return;
         }
 
         Class.forName("org.sqlite.JDBC");
         Set<String> candidates = new TreeSet<>();
+        Set<String> configClasses = new TreeSet<>();
+        configClasses.addAll(methodLinesMap.keySet());
+        configClasses.addAll(classOnly);
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
-            try (PreparedStatement ps = c.prepareStatement("SELECT test FROM impact WHERE class = ?")) {
-                for (String fqcn : changed.keySet()) {
+            for (String fqcn : candidateClasses) {
+                boolean isCfg = configClasses.contains(fqcn);
+                // config changes: prefer DIRECT coverage (test_covers) so we don't explode via the
+                // transitive reference closure; fall back to impact when nothing is directly covered.
+                String tbl = (isCfg && haveCoverage) ? "test_covers" : "impact";
+                try (PreparedStatement ps = c.prepareStatement("SELECT test FROM " + tbl + " WHERE class = ?")) {
                     ps.setString(1, topLevel(fqcn));
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) candidates.add(rs.getString(1));
                     }
                 }
+                if (isCfg && haveCoverage && !candidates.isEmpty()) {
+                    // direct coverage found; keep it (precise)
+                } else if (isCfg && haveCoverage) {
+                    try (PreparedStatement ps = c.prepareStatement("SELECT test FROM impact WHERE class = ?")) {
+                        ps.setString(1, topLevel(fqcn));
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) candidates.add(rs.getString(1));
+                        }
+                    }
+                }
             }
+        }
+
+        if (!haveCoverage) {
+            // No per-test exec / compiled classes: degrade to class-level union (same set as
+            // `impacted --configfile`), never a false negative vs the class-level impact.
+            if (opts.containsKey("csv")) { candidates.forEach(System.out::println); return; }
+            System.out.println("refine: " + candidateClasses.size() + " changed classes, "
+                    + candidates.size() + " tests (class-level union; no per-test coverage available)");
+            System.out.println("Changed classes: " + candidateClasses);
+            if (!methodLinesMap.isEmpty()) {
+                System.out.println("Resolved consumer method line ranges (pass --per-test + --classes to narrow):");
+                methodLinesMap.forEach((k, v) -> {
+                    int lo = Collections.min(v), hi = Collections.max(v);
+                    System.out.println("  " + k + " [" + lo + "-" + hi + "] (" + v.size() + " lines)");
+                });
+            }
+            System.out.println("Tests to re-run (" + candidates.size() + "):");
+            if (candidates.isEmpty()) System.out.println("  (none)");
+            else candidates.forEach(t -> System.out.println("  " + t));
+            return;
         }
 
         Set<String> inScope = new TreeSet<>();
         Map<String, Set<String>> touchedMethods = new HashMap<>();
         for (String test : candidates) {
             boolean hit = false;
-            for (String fqcn : changed.keySet()) {
-                RefineHit rh = coversChangedLines(perTest, classesDir, test, topLevel(fqcn), changed.get(fqcn));
+            for (String fqcn : javaChanged.keySet()) {
+                RefineHit rh = coversChangedLines(perTest, classesDir, test, topLevel(fqcn), javaChanged.get(fqcn));
                 if (rh.hit) {
                     hit = true;
-                    if (!rh.methods.isEmpty()) {
+                    if (!rh.methods.isEmpty())
                         touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(rh.methods);
-                    }
+                }
+            }
+            // class-level config consumers: candidate already came from direct coverage -> include
+            if (!classOnly.isEmpty()) hit = true;
+            for (String fqcn : methodLinesMap.keySet()) {
+                RefineHit rh = coversChangedLines(perTest, classesDir, test, topLevel(fqcn), methodLinesMap.get(fqcn));
+                if (rh.hit) {
+                    hit = true;
+                    if (!rh.methods.isEmpty())
+                        touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(rh.methods);
                 }
             }
             if (hit) inScope.add(test);
@@ -886,7 +1018,7 @@ public class TestGraph {
         }
         System.out.println("refine: " + candidates.size() + " tests at class-level impact, "
                 + inScope.size() + " tests actually cover changed lines/methods");
-        System.out.println("Changed classes: " + changed.keySet());
+        System.out.println("Changed classes: " + candidateClasses);
         System.out.println("Tests to re-run (" + inScope.size() + "):");
         if (inScope.isEmpty()) System.out.println("  (none)");
         else for (String t : inScope) {
@@ -993,6 +1125,92 @@ public class TestGraph {
             if (fqcn != null) javaChanged.put(fqcn, e.getValue());
         }
         return javaChanged;
+    }
+
+    // config-change-aware refinement helpers (item B)
+
+    private static String configKeyFor(String cfg) {
+        String n = Paths.get(cfg.replace('\\', '/')).getFileName().toString();
+        if (CONFIG_CONSUMERS_BY_BASENAME.containsKey(n)) return n;
+        if (cfg.replace('\\', '/').contains("/config/registries/")) return "registry";
+        return null;
+    }
+
+    private static Set<String> configConsumersFor(String cfg) {
+        Set<String> s = new TreeSet<>();
+        String n = Paths.get(cfg.replace('\\', '/')).getFileName().toString();
+        String[] classes = CONFIG_CONSUMERS_BY_BASENAME.get(n);
+        if (classes != null) {
+            for (String cls : classes) s.add(cls);
+        } else if (cfg.replace('\\', '/').contains("/config/registries/")) {
+            for (String cls : REGISTRY_CONSUMERS) s.add(cls);
+        }
+        return s;
+    }
+
+    /**
+     * Extract changed config entities (field name, form id, step id, registry dc-schema/element/
+     * qualifier) from the diff hunk of the given config file. Returns an empty set for a whole-file
+     * add/delete or when no recognizable entity is touched -> caller falls back to class-level.
+     */
+    private static Set<String> parseConfigEntities(List<String> lines, String cfgPath) {
+        Set<String> ents = new TreeSet<>();
+        String want = Paths.get(cfgPath.replace('\\', '/')).getFileName().toString();
+        boolean inCfg = false;
+        Pattern field = Pattern.compile("<field\\b[^>]*\\bname=\"([^\"]+)\"");
+        Pattern form = Pattern.compile("<form\\b[^>]*\\bid=\"([^\"]+)\"");
+        Pattern step = Pattern.compile("<step\\b[^>]*\\bid=\"([^\"]+)\"");
+        Pattern schema = Pattern.compile("<dc-schema>([^<]+)</dc-schema>");
+        Pattern element = Pattern.compile("<dc-element>([^<]+)</dc-element>");
+        Pattern qualifier = Pattern.compile("<dc-qualifier>([^<]+)</dc-qualifier>");
+        for (String line : lines) {
+            if (line.startsWith("+++ ")) {
+                String p = line.substring(4).strip();
+                if (p.equals("/dev/null")) { inCfg = false; continue; }
+                if (p.startsWith("b/")) p = p.substring(2);
+                inCfg = Paths.get(p.replace('\\', '/')).getFileName().toString().equals(want);
+            } else if (inCfg && (line.startsWith("@@") || line.startsWith("+") || line.startsWith(" "))) {
+                String content = line.length() > 1 ? line.substring(1) : "";
+                Matcher m;
+                if ((m = field.matcher(content)).find()) ents.add("field:" + m.group(1));
+                if ((m = form.matcher(content)).find()) ents.add("form:" + m.group(1));
+                if ((m = step.matcher(content)).find()) ents.add("step:" + m.group(1));
+                if ((m = schema.matcher(content)).find()) ents.add("dc-schema:" + m.group(1).trim());
+                if ((m = element.matcher(content)).find()) ents.add("dc-element:" + m.group(1).trim());
+                if ((m = qualifier.matcher(content)).find()) ents.add("dc-qualifier:" + m.group(1).trim());
+            }
+        }
+        return ents;
+    }
+
+    private static int[] methodLines(Path classesDir, String fqcn, String method) {
+        Path cf = classesDir.resolve(fqcn.replace('.', '/') + ".class");
+        if (!Files.exists(cf)) return null;
+        try {
+            byte[] b = Files.readAllBytes(cf);
+            ClassReader r = new ClassReader(b);
+            int[] res = {-1, -1};
+            r.accept(new ClassVisitor(Opcodes.ASM9) {
+                public MethodVisitor visitMethod(int access, String name, String desc, String sig, String[] ex) {
+                    if (!name.equals(method)) return null;
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        public void visitLineNumber(int ln, Label label) {
+                            if (res[0] < 0) res[0] = ln;
+                            if (ln > res[1]) res[1] = ln;
+                        }
+                    };
+                }
+            }, 0);
+            return res[0] < 0 ? null : res;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static Set<Integer> linesRange(int a, int b) {
+        Set<Integer> s = new TreeSet<>();
+        for (int l = a; l <= b; l++) s.add(l);
+        return s;
     }
 
     // -------------------------------------------------------------- aggregate

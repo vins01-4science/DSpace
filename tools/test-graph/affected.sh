@@ -10,6 +10,11 @@
 #
 # Usage:
 #   tools/test-graph/affected.sh --db <index.sqlite> --base <sha> [--head <sha>] [--out <dir>]
+#                                  [--per-test <dir>] [--classes <dir>]
+#
+# When --per-test (per-test JaCoCo .exec dir) and --classes (compiled classes dir) are given,
+# non-Spring XML config changes are routed through `refine --configfile` for method-level
+# precision instead of the class-level `impacted --configfile` fallback.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -19,6 +24,8 @@ DB=""
 BASE=""
 HEAD="HEAD"
 OUT_DIR="$REPO/target/test-graph/affected"
+PER_TEST=""
+CLASSES=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,12 +33,14 @@ while [[ $# -gt 0 ]]; do
     --base) BASE="$2"; shift 2 ;;
     --head) HEAD="$2"; shift 2 ;;
     --out)  OUT_DIR="$2"; shift 2 ;;
+    --per-test) PER_TEST="$2"; shift 2 ;;
+    --classes)  CLASSES="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$DB" || -z "$BASE" ]]; then
-  echo "Usage: affected.sh --db <index> --base <sha> [--head <sha>] [--out <dir>]" >&2
+  echo "Usage: affected.sh --db <index> --base <sha> [--head <sha>] [--out <dir>] [--per-test <dir>] [--classes <dir>]" >&2
   exit 2
 fi
 
@@ -78,10 +87,19 @@ for f in "${FILES[@]:-}"; do
     done < <("$TG" impacted --csv --db "$DB" --beanfile "$REPO/$f" 2>/dev/null || true)
   elif [[ "$f" == *.xml ]]; then
     # non-spring XML metadata/form config (submission-forms.xml, item-submission.xml,
-    # dspace/config/registries/*.xml) — mapped to tests via the curated consumer-class map
-    while IFS= read -r t; do
-      [[ -n "$t" ]] && ALL["$t"]=1
-    done < <("$TG" impacted --csv --db "$DB" --configfile "$REPO/$f" 2>/dev/null || true)
+    # dspace/config/registries/*.xml) — mapped to tests via the curated consumer-class map.
+    # With coverage available, use method-level `refine --configfile` (precise); otherwise
+    # the class-level `impacted --configfile` fallback.
+    if [[ -n "$PER_TEST" && -n "$CLASSES" ]]; then
+      while IFS= read -r t; do
+        [[ -n "$t" ]] && ALL["$t"]=1
+      done < <("$TG" refine --csv --db "$DB" --configfile "$REPO/$f" \
+                     --base "$BASE" --head "$HEAD" --per-test "$PER_TEST" --classes "$CLASSES" 2>/dev/null || true)
+    else
+      while IFS= read -r t; do
+        [[ -n "$t" ]] && ALL["$t"]=1
+      done < <("$TG" impacted --csv --db "$DB" --configfile "$REPO/$f" 2>/dev/null || true)
+    fi
   fi
 done
 
@@ -100,7 +118,7 @@ if ((${#UT[@]}));  then printf '%s\n' "${UT[@]}"  | sort -u | paste -sd, - > "$O
 if ((${#IT[@]}));  then printf '%s\n' "${IT[@]}"  | sort -u | paste -sd, - > "$OUT_DIR/it.csv";  fi
 if ((${#MODS[@]})); then printf '%s\n' "${!MODS[@]}" | sort -u > "$OUT_DIR/modules.txt"; fi
 
-echo "affected: ${#ALL[@]} tests (UT=$(< "$OUT_DIR/ut.csv" tr ',' '\n' | grep -c .) IT=$(< "$OUT_DIR/it.csv" tr ',' '\n' | grep -c .)) across $(< "$OUT_DIR/modules.txt" | grep -c .) modules"
+echo "affected: ${#ALL[@]} tests (UT=$(< "$OUT_DIR/ut.csv" tr ',' '\n' | grep -c .) IT=$(< "$OUT_DIR/it.csv" tr ',' '\n' | grep -c .)) across $(grep -c . "$OUT_DIR/modules.txt") modules"
 echo "  UT_CSV : $(cat "$OUT_DIR/ut.csv")"
 echo "  IT_CSV : $(cat "$OUT_DIR/it.csv")"
 echo "  MODULES: $(paste -sd, - < "$OUT_DIR/modules.txt")"
