@@ -657,7 +657,8 @@ public class TestGraph {
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             c.setAutoCommit(false);
             String[] drops = {"class_refs", "test_covers", "impact",
-                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact"};
+                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
+                    "config_consumers"};
             for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
             c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
             c.createStatement().execute("CREATE TABLE test_covers(test TEXT, class TEXT)");
@@ -667,6 +668,7 @@ public class TestGraph {
             c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
             c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
             c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
+            c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
             try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
                  PreparedStatement ps2 = c.prepareStatement("INSERT INTO test_covers VALUES (?,?)");
                  PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)");
@@ -674,7 +676,8 @@ public class TestGraph {
                  PreparedStatement ps5 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
                  PreparedStatement ps6 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
                  PreparedStatement ps7 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
-                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)")) {
+                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)");
+                 PreparedStatement ps9 = c.prepareStatement("INSERT INTO config_consumers VALUES (?,?)")) {
                 for (Map.Entry<String, Set<String>> e : refs.entrySet()) {
                     for (String to : e.getValue()) {
                         ps1.setString(1, e.getKey());
@@ -704,6 +707,7 @@ public class TestGraph {
                     ps5.setString(1, r[0]); ps5.setString(2, r[1]); ps5.setString(3, r[2]); ps5.addBatch();
                 }
                 for (String[] r : configKeys) {
+                    if (r.length < 2) continue;
                     ps6.setString(1, r[0]); ps6.setString(2, r[1]); ps6.addBatch();
                 }
                 for (String[] r : beanDecls) {
@@ -717,9 +721,13 @@ public class TestGraph {
                         ps8.addBatch();
                     }
                 }
+                for (String[] r : configConsumers) {
+                    if (r.length < 2) continue;
+                    ps9.setString(1, r[0]); ps9.setString(2, r[1]); ps9.addBatch();
+                }
                 ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
                 ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
-                ps7.executeBatch(); ps8.executeBatch();
+                ps7.executeBatch(); ps8.executeBatch(); ps9.executeBatch();
             }
             c.commit();
         }
