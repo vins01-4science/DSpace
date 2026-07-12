@@ -864,11 +864,13 @@ public class TestGraph {
     // ---------------------------------------------------------------- validate
 
     private static void validateCmd(Map<String, String> opts) throws Exception {
-        Path module = Paths.get(require(opts, "module"));
+        String moduleArg = opts.get("module");
         Path perTest = Paths.get(opts.getOrDefault("per-test",
-                module.resolve("target/per-test").toString()));
+                moduleArg != null ? Paths.get(moduleArg).resolve("target/per-test").toString()
+                                  : "target/per-test"));
         Path db = Paths.get(opts.getOrDefault("db",
-                module.resolve("target/test-graph/impact-index.sqlite").toString()));
+                moduleArg != null ? Paths.get(moduleArg).resolve("target/test-graph/impact-index.sqlite").toString()
+                                  : "impact-index.sqlite"));
 
         // 1) at least one non-empty per-test exec
         long execCount = 0;

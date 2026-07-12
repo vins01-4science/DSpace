@@ -29,6 +29,7 @@ MODULES=""
 ROOT_ARG=""
 OUT="$REPO/target/test-graph/root-index.sqlite"
 MVN="${MVN:-mvn}"
+OFFLINE=""   # CI runs online; pass --offline to reuse a local ~/.m2 cache
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --root) ROOT_ARG="--root $2"; shift ;;
     --out) OUT="$2"; shift ;;
     --mvn) MVN="$2"; shift ;;
+    --offline) OFFLINE="-o" ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -61,7 +63,7 @@ for M in $MODULES; do
     GOAL=test
     [[ "$RUN_IT" -eq 1 ]] && GOAL=verify
     echo ">> mvn -pl $M -Ptest-class-graph -DskipUnitTests=false ${RUN_IT:+-DskipIntegrationTests=false} $GOAL"
-    "$MVN" -o -pl "$M" -Ptest-class-graph -DskipUnitTests=false \
+    "$MVN" $OFFLINE -pl "$M" -Ptest-class-graph -DskipUnitTests=false \
       ${RUN_IT:+-DskipIntegrationTests=false} "$GOAL" > "/tmp/phase-all-$M.log" 2>&1 \
       || { echo "!! $M tests failed (see /tmp/phase-all-$M.log)"; continue; }
   fi
