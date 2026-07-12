@@ -56,16 +56,21 @@ rm -rf "$PER_TEST"
 
 if [[ -n "$SHARD" && -n "$TOTAL" ]]; then
   bash "$REPO/tools/test-graph/split-tests.sh" --module "$MODULE" --total "$TOTAL"
-  UT_FILE="$REPO/$MODULE/target/test-graph/shard-$((SHARD-1))-ut.txt"
-  IT_FILE="$REPO/$MODULE/target/test-graph/shard-$((SHARD-1))-it.txt"
-  if [[ -s "$UT_FILE" ]]; then
+  # Pass the test list inline (comma-separated FQCNs). Surefire/Failsafe's
+  # `-Dtest=@file` form is unreliable in this build, but an inline `-Dtest`
+  # list works from any CWD, so we build it from the shard file.
+  UT_REL="target/test-graph/shard-$((SHARD-1))-ut.txt"
+  IT_REL="target/test-graph/shard-$((SHARD-1))-it.txt"
+  if [[ -s "$MODULE/$UT_REL" ]]; then
+    UT_LIST="$(paste -sd, "$MODULE/$UT_REL")"
     "$MVN" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
-      test -Dtest="@$UT_FILE" \
+      test "-Dtest=$UT_LIST" \
       || echo "!! unit tests failed for $MODULE shard $SHARD (continuing to build partial index)"
   fi
-  if [[ "$RUN_IT" -eq 1 && -s "$IT_FILE" ]]; then
+  if [[ "$RUN_IT" -eq 1 && -s "$MODULE/$IT_REL" ]]; then
+    IT_LIST="$(paste -sd, "$MODULE/$IT_REL")"
     "$MVN" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
-      verify -Dit.test="@$IT_FILE" \
+      verify "-Dit.test=$IT_LIST" \
       || echo "!! integration tests failed for $MODULE shard $SHARD (continuing)"
   fi
 else
