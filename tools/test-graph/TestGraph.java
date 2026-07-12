@@ -17,6 +17,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.Collection;
@@ -24,6 +25,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -1292,11 +1294,15 @@ public class TestGraph {
         Map<String, Set<String>> impact = new HashMap<>();
         Map<String, Set<String>> covers = new HashMap<>();
         Map<String, Set<String>> refs = new HashMap<>();
-        List<String[]> propRefs = new ArrayList<>();
-        List<String[]> beanRefs = new ArrayList<>();
-        List<String[]> configKeys = new ArrayList<>();
-        List<String[]> beanDecls = new ArrayList<>();
-        List<String[]> configConsumers = new ArrayList<>();
+        // Deduped: when merging shards of the *same* module, the module-level
+        // static/config rows are repeated in every partial index, so they must
+        // collapse here. impact/test_covers/class_refs already dedup via maps,
+        // and property_impact is recomputed below from the merged set.
+        Set<List<String>> propRefs = new LinkedHashSet<>();
+        Set<List<String>> beanRefs = new LinkedHashSet<>();
+        Set<List<String>> configKeys = new LinkedHashSet<>();
+        Set<List<String>> beanDecls = new LinkedHashSet<>();
+        Set<List<String>> configConsumers = new LinkedHashSet<>();
 
         Class.forName("org.sqlite.JDBC");
         for (Path db : dbs) {
@@ -1304,18 +1310,18 @@ public class TestGraph {
                 mergeMap(c, "SELECT class, test FROM impact", impact);
                 mergeMap(c, "SELECT test, class FROM test_covers", covers);
                 mergeMap(c, "SELECT from_c, to_c FROM class_refs", refs);
-                propRefs.addAll(readDb(c, "SELECT from_c, key, kind FROM property_refs"));
-                beanRefs.addAll(readDb(c, "SELECT from_c, ref, kind FROM bean_refs"));
-                configKeys.addAll(readDb(c, "SELECT file, key FROM config_keys"));
-                beanDecls.addAll(readDb(c, "SELECT file, bean_type, bean_id FROM bean_decls"));
-                configConsumers.addAll(readDb(c, "SELECT file, class FROM config_consumers"));
+                for (String[] r : readDb(c, "SELECT from_c, key, kind FROM property_refs")) propRefs.add(Arrays.asList(r));
+                for (String[] r : readDb(c, "SELECT from_c, ref, kind FROM bean_refs")) beanRefs.add(Arrays.asList(r));
+                for (String[] r : readDb(c, "SELECT file, key FROM config_keys")) configKeys.add(Arrays.asList(r));
+                for (String[] r : readDb(c, "SELECT file, bean_type, bean_id FROM bean_decls")) beanDecls.add(Arrays.asList(r));
+                for (String[] r : readDb(c, "SELECT file, class FROM config_consumers")) configConsumers.add(Arrays.asList(r));
             }
         }
 
         Map<String, Set<String>> propImpact = new HashMap<>();
-        for (String[] pr : propRefs) {
-            Set<String> tests = impact.get(topLevel(pr[0]));
-            if (tests != null) propImpact.computeIfAbsent(pr[1], k -> new HashSet<>()).addAll(tests);
+        for (List<String> pr : propRefs) {
+            Set<String> tests = impact.get(topLevel(pr.get(0)));
+            if (tests != null) propImpact.computeIfAbsent(pr.get(1), k -> new HashSet<>()).addAll(tests);
         }
 
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out)) {
@@ -1348,13 +1354,13 @@ public class TestGraph {
                     for (String cls : e.getValue()) { ps2.setString(1, e.getKey()); ps2.setString(2, cls); ps2.addBatch(); }
                 for (Map.Entry<String, Set<String>> e : impact.entrySet())
                     for (String t : e.getValue()) { ps3.setString(1, e.getKey()); ps3.setString(2, t); ps3.addBatch(); }
-                for (String[] r : propRefs) { ps4.setString(1, r[0]); ps4.setString(2, r[1]); ps4.setString(3, r[2]); ps4.addBatch(); }
-                for (String[] r : beanRefs) { ps5.setString(1, r[0]); ps5.setString(2, r[1]); ps5.setString(3, r[2]); ps5.addBatch(); }
-                for (String[] r : configKeys) { ps6.setString(1, r[0]); ps6.setString(2, r[1]); ps6.addBatch(); }
-                for (String[] r : beanDecls) { ps7.setString(1, r[0]); ps7.setString(2, r[1]); ps7.setString(3, r.length > 2 ? r[2] : ""); ps7.addBatch(); }
+                for (List<String> r : propRefs) { ps4.setString(1, r.get(0)); ps4.setString(2, r.get(1)); ps4.setString(3, r.get(2)); ps4.addBatch(); }
+                for (List<String> r : beanRefs) { ps5.setString(1, r.get(0)); ps5.setString(2, r.get(1)); ps5.setString(3, r.get(2)); ps5.addBatch(); }
+                for (List<String> r : configKeys) { ps6.setString(1, r.get(0)); ps6.setString(2, r.get(1)); ps6.addBatch(); }
+                for (List<String> r : beanDecls) { ps7.setString(1, r.get(0)); ps7.setString(2, r.get(1)); ps7.setString(3, r.size() > 2 ? r.get(2) : ""); ps7.addBatch(); }
                 for (Map.Entry<String, Set<String>> e : propImpact.entrySet())
                     for (String t : e.getValue()) { ps8.setString(1, e.getKey()); ps8.setString(2, t); ps8.addBatch(); }
-                for (String[] r : configConsumers) { ps9.setString(1, r[0]); ps9.setString(2, r[1]); ps9.addBatch(); }
+                for (List<String> r : configConsumers) { ps9.setString(1, r.get(0)); ps9.setString(2, r.get(1)); ps9.addBatch(); }
                 ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
                 ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
                 ps7.executeBatch(); ps8.executeBatch(); ps9.executeBatch();

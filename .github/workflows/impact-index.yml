@@ -1,11 +1,18 @@
 # Impact Index (baseline) — builds and publishes the repo-wide test-impact
-# index from the branch you branch FROM (typically `main`).
+# index from `main`.
 #
 # The index maps every source class / property / config file / bean declaration
 # to the tests that must be re-run when it changes. Pull-request runs
 # (test-affected.yml) download THIS artifact instead of rebuilding it.
 #
 # Trigger: every push to `main` (and manual dispatch).
+#
+# Parallelization strategy: tests are sharded across a CI matrix. Each matrix
+# cell runs ONE module + ONE shard (a subset of that module's test classes) and
+# produces a PARTIAL index from only that shard's coverage. A final `merge` job
+# downloads every partial index and unions them with `aggregate` into the
+# repo-wide `root-index.sqlite`. Because each shard observes a disjoint set of
+# tests, the union is content-equivalent to a single sequential build.
 name: Impact Index (baseline)
 
 on:
@@ -17,28 +24,56 @@ permissions:
   contents: read  # checkout + publish artifact
 
 jobs:
-  build-index:
+  # Emit the build matrix: one cell per (module, shard). Shard counts are tuned
+  # to each module's test volume; raise a number to spread that module's tests
+  # across more workers.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: set
+        run: |
+          # module:shardCount
+          SHARDS=(
+            "dspace-api:8"
+            "dspace-server-webapp:4"
+            "dspace-oai:2"
+            "dspace-services:1"
+            "dspace-rdf:1"
+            "dspace-sword:1"
+            "dspace-swordv2:1"
+            "dspace-iiif:1"
+            "dspace-saml2:1"
+          )
+          items=()
+          for entry in "${SHARDS[@]}"; do
+            mod="${entry%%:*}"; total="${entry##*:}"
+            for ((i=1; i<=total; i++)); do
+              items+=("{\"module\":\"$mod\",\"shard\":$i,\"total\":$total}")
+            done
+          done
+          json=$(printf '%s\n' "${items[@]}" | paste -sd, -)
+          echo "matrix={\"include\":[$json]}" >> "$GITHUB_OUTPUT"
+
+  # Assemble the test install ONCE (installs all modules + the server-webapp
+  # test environment + the dspace-test-trace listener into the local Maven
+  # repo). The parallel `build` jobs depend on this job and reuse the populated
+  # `cache: maven`, so they only compile and test their own module.
+  assemble:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       MAVEN_OPTS: "-Xmx2048M"
     steps:
-      - name: Checkout codebase
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-      - name: Install JDK 21
-        uses: actions/setup-java@v5
+      - uses: actions/setup-java@v5
         with:
           java-version: 21
           distribution: 'temurin'
           cache: 'maven'
-
-      # Resolve the jars the single-file TestGraph.java tool needs at runtime.
-      - name: Fetch test-graph tool dependencies
-        run: |
-          mvn -B -V dependency:get -Dartifact=org.jacoco:org.jacoco.core:0.8.14
-          mvn -B -V dependency:get -Dartifact=org.ow2.asm:asm:9.7.1
-          mvn -B -V dependency:get -Dartifact=org.xerial:sqlite-jdbc:3.21.0.1
 
       # dspace-test-trace is NOT part of the reactor (added as a test dependency
       # by the test-class-graph profile), so install it explicitly.
@@ -54,12 +89,92 @@ jobs:
             -Denforcer.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true \
             -Dxml.skip=true -Dspotbugs.skip=true -Dpmd.skip=true
 
-      # Run per-test coverage (unit + integration, both on H2) across all modules,
-      # build per-module indexes and aggregate into the root index.
-      - name: Build test-impact index
+  # One cell per (module, shard): run ONLY that shard's tests and write a
+  # PARTIAL index. Runs in parallel; a shard's test failure does not fail the
+  # job (the partial index is still produced — the PR gate runs the real
+  # affected tests and would surface failures).
+  build:
+    needs: [plan, assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      MAVEN_OPTS: "-Xmx2048M"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # Resolve the jars the single-file TestGraph.java tool needs at runtime.
+      - name: Fetch test-graph tool dependencies
         run: |
-          bash tools/test-graph/phase-all.sh --it --root . \
-            --out target/test-graph/root-index.sqlite
+          mvn -B -V dependency:get -Dartifact=org.jacoco:org.jacoco.core:0.8.14
+          mvn -B -V dependency:get -Dartifact=org.ow2.asm:asm:9.7.1
+          mvn -B -V dependency:get -Dartifact=org.xerial:sqlite-jdbc:3.21.0.1
+
+      # dspace-test-trace + all upstream modules are already in the Maven cache
+      # (populated by the `assemble` job), so only this module is built/tested.
+      - name: Build partial impact index (shard ${{ matrix.shard }}/${{ matrix.total }})
+        run: |
+          bash tools/test-graph/phase-module.sh "${{ matrix.module }}" \
+            --shard ${{ matrix.shard }} ${{ matrix.total }} --it --root . \
+            --db-out "target/test-graph/idx-${{ matrix.module }}-${{ matrix.shard }}.sqlite"
+
+      - name: Upload partial index
+        uses: actions/upload-artifact@v7
+        with:
+          name: idx-${{ matrix.module }}-${{ matrix.shard }}
+          path: target/test-graph/idx-${{ matrix.module }}-${{ matrix.shard }}.sqlite
+          retention-days: 7
+
+  # Download every partial index and union them into the repo-wide index.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MAVEN_OPTS: "-Xmx2048M"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Fetch test-graph tool dependencies
+        run: |
+          mvn -B -V dependency:get -Dartifact=org.jacoco:org.jacoco.core:0.8.14
+          mvn -B -V dependency:get -Dartifact=org.ow2.asm:asm:9.7.1
+          mvn -B -V dependency:get -Dartifact=org.xerial:sqlite-jdbc:3.21.0.1
+
+      - name: Download partial indexes
+        uses: actions/download-artifact@v7
+        with:
+          pattern: idx-*
+          path: partial
+          merge-multiple: true
+
+      - name: Aggregate into root index
+        run: |
+          ARGS=()
+          i=1
+          while IFS= read -r f; do
+            if [[ $i -eq 1 ]]; then ARGS+=(--db "$f"); else ARGS+=(--db$i "$f"); fi
+            i=$((i+1))
+          done < <(find partial -name 'idx-*.sqlite' | sort)
+          if [[ ${#ARGS[@]} -eq 0 ]]; then
+            echo "No partial indexes downloaded!" >&2; exit 1
+          fi
+          bash tools/test-graph/run.sh aggregate \
+            --out target/test-graph/root-index.sqlite "${ARGS[@]}"
 
       - name: Validate test-impact index
         run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite || true
