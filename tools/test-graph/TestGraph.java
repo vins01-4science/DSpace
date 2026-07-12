@@ -18,6 +18,7 @@ import java.sql.ResultSet;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
@@ -269,39 +270,82 @@ public class TestGraph {
             "org.dspace.administer.RegistryLoader"};
 
     /**
-     * Curated config change -> consumer (class, method) map used by {@code refine --configfile}
-     * for method-level narrowing. A {@code null} method means the whole class is the relevant
-     * code portion (class-level). Keyed by config basename, or {@code "registry"} for any file
-     * under {@code dspace/config/registries/}. This is an extension point: tighten or widen the
-     * method list per config entity to trade precision against recall.
+     * Kind of config entity that changed, used to pick the precise consumer methods for
+     * {@code refine --configfile} method-level narrowing. Keying by kind (not by config file)
+     * means a change to ONE entity pulls only the consumer methods that read THAT entity, not
+     * the whole config's method set.
      */
-    private static final Map<String, List<ClassMethod>> CONFIG_ENTITY_METHODS = new LinkedHashMap<>();
+    private enum CfgKind { FORM, NAMEMAP, STEP, FIELD, METADATA, REGISTRY }
+
+    /** A changed config entity: its kind plus the matched value (form/step/field/entity-type...). */
+    private static final class ConfigEntity {
+        final CfgKind kind;
+        final String value;
+        ConfigEntity(CfgKind kind, String value) { this.kind = kind; this.value = value; }
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof ConfigEntity)) return false;
+            ConfigEntity e = (ConfigEntity) o;
+            return kind == e.kind && value.equals(e.value);
+        }
+        public int hashCode() { return 31 * kind.hashCode() + value.hashCode(); }
+    }
+
+    /**
+     * Curated config-entity change -> consumer (class, method) map used by {@code refine --configfile}
+     * for method-level narrowing. A {@code null} method means the whole class is the relevant code
+     * portion (class-level). Keyed by the kind of config entity that changed. Extension point:
+     * widen/narrow the method list per entity kind to trade precision against recall.
+     */
+    private static final Map<CfgKind, List<ClassMethod>> CONFIG_ENTITY_CONSUMERS = new EnumMap<>(CfgKind.class);
     static {
-        CONFIG_ENTITY_METHODS.put("submission-forms.xml", new ArrayList<ClassMethod>() {{
-            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "<init>"));
-            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsByFormName"));
-            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsByCollection"));
-            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsBySubmissionName"));
-            add(new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputFormNameByCollectionAndField"));
-            add(new ClassMethod("org.dspace.app.util.DCInput", "getLabel"));
-            add(new ClassMethod("org.dspace.app.util.DCInput", "getElement"));
-            add(new ClassMethod("org.dspace.app.util.DCInput", "getSchema"));
-            add(new ClassMethod("org.dspace.app.util.DCInput", "getQualifier"));
-            add(new ClassMethod("org.dspace.app.util.DCInput", "isRequired"));
-            add(new ClassMethod("org.dspace.content.authority.DCInputAuthority", "getChoiceAuthority"));
-            add(new ClassMethod("org.dspace.app.util.Util", "differenceInSubmissionFields"));
-        }});
-        CONFIG_ENTITY_METHODS.put("item-submission.xml", new ArrayList<ClassMethod>() {{
-            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "<init>"));
-            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByName"));
-            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByCollection"));
-            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getStepConfig"));
-            add(new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByInProgressSubmission"));
-        }});
-        CONFIG_ENTITY_METHODS.put("registry", new ArrayList<ClassMethod>() {{
-            add(new ClassMethod("org.dspace.administer.MetadataImporter", "loadRegistry"));
-            add(new ClassMethod("org.dspace.administer.RegistryLoader", "loadBitstreamFormats"));
-        }});
+        CONFIG_ENTITY_CONSUMERS.put(CfgKind.FORM, List.of(
+                new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsByFormName"),
+                new ClassMethod("org.dspace.app.util.DCInputsReader", "getInputsBySubmissionName")));
+        // entity-type -> submission-name binding lives in item-submission.xml <name-map> and applies
+        // ONLY to workspace & workflow items (they carry a defined entity-type from their collection).
+        // Consumers are the resolution path plus the workspace/workflow REST submission converters.
+        CONFIG_ENTITY_CONSUMERS.put(CfgKind.NAMEMAP, List.of(
+                new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getEntityTypeSubmission"),
+                new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByCollection"),
+                new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "processMap"),
+                new ClassMethod("org.dspace.submit.service.SubmissionConfigServiceImpl", "getSubmissionConfigByCollection"),
+                new ClassMethod("org.dspace.app.rest.converter.AInprogressItemConverter", "convert"),
+                new ClassMethod("org.dspace.app.rest.repository.WorkspaceItemRestRepository", "convert"),
+                new ClassMethod("org.dspace.app.rest.converter.WorkflowItemConverter", "convert"),
+                new ClassMethod("org.dspace.app.rest.converter.ClaimedTaskConverter", "convert"),
+                new ClassMethod("org.dspace.app.rest.converter.PoolTaskConverter", "convert")));
+        CONFIG_ENTITY_CONSUMERS.put(CfgKind.STEP, List.of(
+                new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getStepConfig"),
+                new ClassMethod("org.dspace.app.util.SubmissionConfigReader", "getSubmissionConfigByInProgressSubmission")));
+        // A metadata <field> (dot: dc.contributor.author) OR a comma-list of fields is consumed by the
+        // metadata services: authority/choice read dot keys; security reads the comma-list
+        // (metadata.publicField) with dot + .*/dc.* wildcards; validation + submission-field diff read
+        // the form field. Both notations are therefore covered.
+        CONFIG_ENTITY_CONSUMERS.put(CfgKind.FIELD, List.of(
+                new ClassMethod("org.dspace.content.authority.MetadataAuthorityServiceImpl", "init"),
+                new ClassMethod("org.dspace.content.authority.ChoiceAuthorityServiceImpl", "config2fkey"),
+                new ClassMethod("org.dspace.content.authority.ChoiceAuthorityServiceImpl", "loadChoiceAuthorityConfigurations"),
+                new ClassMethod("org.dspace.content.security.MetadataSecurityServiceImpl", "getPublicMetadataFromConfig"),
+                new ClassMethod("org.dspace.content.security.MetadataSecurityServiceImpl", "metadataMatch"),
+                new ClassMethod("org.dspace.validation.MetadataValidator", "validate"),
+                new ClassMethod("org.dspace.app.util.Util", "differenceInSubmissionFields"),
+                new ClassMethod("org.dspace.app.util.DCInput", "getSchema"),
+                new ClassMethod("org.dspace.app.util.DCInput", "getElement"),
+                new ClassMethod("org.dspace.app.util.DCInput", "getQualifier"),
+                new ClassMethod("org.dspace.app.util.DCInput", "getLabel"),
+                new ClassMethod("org.dspace.app.util.DCInput", "isRequired")));
+        // A registry metadata-field (<dc-schema>/<dc-element>/<dc-qualifier>) change is consumed by the
+        // registry importers and by the authority/choice services that read that field.
+        CONFIG_ENTITY_CONSUMERS.put(CfgKind.METADATA, List.of(
+                new ClassMethod("org.dspace.administer.MetadataImporter", "loadRegistry"),
+                new ClassMethod("org.dspace.administer.RegistryLoader", "loadBitstreamFormats"),
+                new ClassMethod("org.dspace.content.authority.MetadataAuthorityServiceImpl", "init"),
+                new ClassMethod("org.dspace.content.authority.ChoiceAuthorityServiceImpl", "config2fkey")));
+        CONFIG_ENTITY_CONSUMERS.put(CfgKind.REGISTRY, List.of(
+                new ClassMethod("org.dspace.administer.MetadataImporter", "loadRegistry"),
+                new ClassMethod("org.dspace.administer.RegistryLoader", "loadBitstreamFormats"),
+                new ClassMethod("org.dspace.content.authority.MetadataAuthorityServiceImpl", "init")));
     }
 
     private static final class ClassMethod {
@@ -904,16 +948,19 @@ public class TestGraph {
         Set<String> classOnly = new TreeSet<>();
         if (opts.containsKey("configfile")) {
             String cfg = opts.get("configfile");
-            Set<String> entities = parseConfigEntities(diffLines, cfg);
+            Set<ConfigEntity> entities = parseConfigEntities(diffLines, cfg);
             if (entities.isEmpty()) {
                 // whole-file / unrecognized change -> class-level for all consumers
                 classOnly.addAll(configConsumersFor(cfg));
             } else {
-                String key = configKeyFor(cfg);
-                List<ClassMethod> cms = key == null ? null : CONFIG_ENTITY_METHODS.get(key);
-                if (cms == null || cms.isEmpty()) {
-                    classOnly.addAll(configConsumersFor(cfg));
-                } else {
+                boolean anyResolved = false;
+                for (ConfigEntity e : entities) {
+                    List<ClassMethod> cms = CONFIG_ENTITY_CONSUMERS.get(e.kind);
+                    if (cms == null || cms.isEmpty()) {
+                        classOnly.addAll(configConsumersFor(cfg));
+                        continue;
+                    }
+                    anyResolved = true;
                     for (ClassMethod cm : cms) {
                         if (cm.method == null || classesDir == null) {
                             classOnly.add(cm.cls);
@@ -925,6 +972,7 @@ public class TestGraph {
                         }
                     }
                 }
+                if (!anyResolved) classOnly.addAll(configConsumersFor(cfg));
             }
         }
 
@@ -1129,13 +1177,6 @@ public class TestGraph {
 
     // config-change-aware refinement helpers (item B)
 
-    private static String configKeyFor(String cfg) {
-        String n = Paths.get(cfg.replace('\\', '/')).getFileName().toString();
-        if (CONFIG_CONSUMERS_BY_BASENAME.containsKey(n)) return n;
-        if (cfg.replace('\\', '/').contains("/config/registries/")) return "registry";
-        return null;
-    }
-
     private static Set<String> configConsumersFor(String cfg) {
         Set<String> s = new TreeSet<>();
         String n = Paths.get(cfg.replace('\\', '/')).getFileName().toString();
@@ -1149,17 +1190,24 @@ public class TestGraph {
     }
 
     /**
-     * Extract changed config entities (field name, form id, step id, registry dc-schema/element/
-     * qualifier) from the diff hunk of the given config file. Returns an empty set for a whole-file
-     * add/delete or when no recognizable entity is touched -> caller falls back to class-level.
+     * Extract changed config entities (field name, form name, name-map entity-type, step id,
+     * registry dc-schema/element/qualifier) from the diff hunk of the given config file. Returns
+     * an empty set for a whole-file add/delete or when no recognizable entity is touched -> caller
+     * falls back to class-level. A single <field> value may be a comma-separated list; each entry
+     * becomes its own FIELD entity (covers both dot and list notations).
      */
-    private static Set<String> parseConfigEntities(List<String> lines, String cfgPath) {
-        Set<String> ents = new TreeSet<>();
+    private static Set<ConfigEntity> parseConfigEntities(List<String> lines, String cfgPath) {
+        Set<ConfigEntity> ents = new TreeSet<>((a, b) -> {
+            int c = a.kind.compareTo(b.kind);
+            return c != 0 ? c : a.value.compareTo(b.value);
+        });
         String want = Paths.get(cfgPath.replace('\\', '/')).getFileName().toString();
         boolean inCfg = false;
         Pattern field = Pattern.compile("<field\\b[^>]*\\bname=\"([^\"]+)\"");
-        Pattern form = Pattern.compile("<form\\b[^>]*\\bid=\"([^\"]+)\"");
-        Pattern step = Pattern.compile("<step\\b[^>]*\\bid=\"([^\"]+)\"");
+        Pattern form = Pattern.compile("<form\\b[^>]*\\bname=\"([^\"]+)\"");
+        Pattern namemap = Pattern.compile("<name-map\\b[^>]*\\bcollection-entity-type=\"([^\"]+)\"[^>]*\\bsubmission-name=\"([^\"]+)\"");
+        Pattern namemap2 = Pattern.compile("<name-map\\b[^>]*\\bsubmission-name=\"([^\"]+)\"[^>]*\\bcollection-entity-type=\"([^\"]+)\"");
+        Pattern step = Pattern.compile("<(?:step|step-definition)\\b[^>]*\\bid=\"([^\"]+)\"");
         Pattern schema = Pattern.compile("<dc-schema>([^<]+)</dc-schema>");
         Pattern element = Pattern.compile("<dc-element>([^<]+)</dc-element>");
         Pattern qualifier = Pattern.compile("<dc-qualifier>([^<]+)</dc-qualifier>");
@@ -1172,12 +1220,19 @@ public class TestGraph {
             } else if (inCfg && (line.startsWith("@@") || line.startsWith("+") || line.startsWith(" "))) {
                 String content = line.length() > 1 ? line.substring(1) : "";
                 Matcher m;
-                if ((m = field.matcher(content)).find()) ents.add("field:" + m.group(1));
-                if ((m = form.matcher(content)).find()) ents.add("form:" + m.group(1));
-                if ((m = step.matcher(content)).find()) ents.add("step:" + m.group(1));
-                if ((m = schema.matcher(content)).find()) ents.add("dc-schema:" + m.group(1).trim());
-                if ((m = element.matcher(content)).find()) ents.add("dc-element:" + m.group(1).trim());
-                if ((m = qualifier.matcher(content)).find()) ents.add("dc-qualifier:" + m.group(1).trim());
+                if ((m = field.matcher(content)).find()) {
+                    for (String f : m.group(1).split(",")) {
+                        String t = f.trim();
+                        if (!t.isEmpty()) ents.add(new ConfigEntity(CfgKind.FIELD, t));
+                    }
+                }
+                if ((m = form.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.FORM, m.group(1)));
+                if ((m = namemap.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.NAMEMAP, m.group(1)));
+                else if ((m = namemap2.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.NAMEMAP, m.group(2)));
+                if ((m = step.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.STEP, m.group(1)));
+                if ((m = schema.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.METADATA, m.group(1).trim()));
+                if ((m = element.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.METADATA, m.group(1).trim()));
+                if ((m = qualifier.matcher(content)).find()) ents.add(new ConfigEntity(CfgKind.METADATA, m.group(1).trim()));
             }
         }
         return ents;
@@ -1430,7 +1485,8 @@ public class TestGraph {
         if (i >= 0) return toFqcn(s.substring(i + markerMain.length() + 1));
         int j = s.indexOf(markerTest);
         if (j >= 0) return toFqcn(s.substring(j + markerTest.length() + 1));
-        if (!s.endsWith(".java") && s.contains(".")) return s; // already an fqcn
+        if (!s.endsWith(".java") && !s.contains(File.separator) && !s.contains("/")
+                && s.contains(".")) return s; // already an fqcn (no path separators)
         return null;
     }
 
