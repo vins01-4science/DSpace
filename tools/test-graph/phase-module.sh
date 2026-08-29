@@ -34,7 +34,7 @@ MVN="${MVN:-mvn}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --shard)  SHARD="$2"; TOTAL="$3"; shift 3 ;;
-    --it)     RUN_IT=1 ;;
+    --it)     RUN_IT=1; shift ;;
     --root)   ROOT_ARG="--root $2"; shift 2 ;;
     --db-out) DB_OUT="$2"; shift 2 ;;
     *) echo "phase-module.sh: unknown option: $1" >&2; exit 2 ;;
