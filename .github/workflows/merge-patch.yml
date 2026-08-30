@@ -93,7 +93,19 @@ jobs:
       # good as the tests that actually ran; test goals must always execute.
       - name: Enable Maven build cache (compile-restore only; tests always run)
         run: |
-          mkdir -p "$RUNNER_TEMP/build-cache-config"
+          mkdir -p "$GITHUB_WORKSPACE/.mvn" "$RUNNER_TEMP/build-cache-config"
+          # Load the extension as a CORE extension (repo-level .mvn/extensions.xml,
+          # CI-only — never committed). `-Dmaven.ext.class.path` is NOT supported:
+          # it loads in a child realm where Sisu cannot inject CacheControllerImpl.
+          cat > "$GITHUB_WORKSPACE/.mvn/extensions.xml" <<'EOF'
+          <extensions xmlns="http://maven.apache.org/EXTENSIONS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/EXTENSIONS/1.0.0 https://maven.apache.org/xsd/core-extensions-1.0.0.xsd">
+              <extension>
+                  <groupId>org.apache.maven.extensions</groupId>
+                  <artifactId>maven-build-cache-extension</artifactId>
+                  <version>1.2.3</version>
+              </extension>
+          </extensions>
+          EOF
           cat > "$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml" <<'EOF'
           <cache xmlns="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0 https://maven.apache.org/xsd/build-cache-config-1.2.0.xsd">
               <configuration>
@@ -109,7 +121,7 @@ jobs:
               </executionControl>
           </cache>
           EOF
-          echo "MAVEN_OPTS=-Xmx2048M -Dmaven.ext.class.path=$HOME/.m2/repository/org/apache/maven/extensions/maven-build-cache-extension/1.2.3/maven-build-cache-extension-1.2.3.jar -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
+          echo "MAVEN_OPTS=-Xmx2048M -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
 
       - name: Install listener + test install (skip tests)
         run: |
