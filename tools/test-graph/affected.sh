@@ -10,11 +10,11 @@
 #
 # Usage:
 #   tools/test-graph/affected.sh --db <index.sqlite> --base <sha> [--head <sha>] [--out <dir>]
-#                                  [--per-test <dir>] [--classes <dir>]
 #
-# When --per-test (per-test JaCoCo .exec dir) and --classes (compiled classes dir) are given,
-# non-Spring XML config changes are routed through `refine --configfile` for method-level
-# precision instead of the class-level `impacted --configfile` fallback.
+# Non-Spring XML config changes are routed through `refine --configfile` for method-level
+# precision (refine reads the per-class line coverage straight from the index; when the index
+# has no coverage it degrades to the class-level `impacted --configfile` set). No per-test
+# .exec dir or compiled classes dir are needed.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -24,8 +24,6 @@ DB=""
 BASE=""
 HEAD="HEAD"
 OUT_DIR="$REPO/target/test-graph/affected"
-PER_TEST=""
-CLASSES=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,14 +31,12 @@ while [[ $# -gt 0 ]]; do
     --base) BASE="$2"; shift 2 ;;
     --head) HEAD="$2"; shift 2 ;;
     --out)  OUT_DIR="$2"; shift 2 ;;
-    --per-test) PER_TEST="$2"; shift 2 ;;
-    --classes)  CLASSES="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -z "$DB" || -z "$BASE" ]]; then
-  echo "Usage: affected.sh --db <index> --base <sha> [--head <sha>] [--out <dir>] [--per-test <dir>] [--classes <dir>]" >&2
+  echo "Usage: affected.sh --db <index> --base <sha> [--head <sha>] [--out <dir>]" >&2
   exit 2
 fi
 
@@ -88,18 +84,12 @@ for f in "${FILES[@]:-}"; do
   elif [[ "$f" == *.xml ]]; then
     # non-spring XML metadata/form config (submission-forms.xml, item-submission.xml,
     # dspace/config/registries/*.xml) — mapped to tests via the curated consumer-class map.
-    # With coverage available, use method-level `refine --configfile` (precise); otherwise
-    # the class-level `impacted --configfile` fallback.
-    if [[ -n "$PER_TEST" && -n "$CLASSES" ]]; then
-      while IFS= read -r t; do
-        [[ -n "$t" ]] && ALL["$t"]=1
-      done < <("$TG" refine --csv --db "$DB" --configfile "$REPO/$f" \
-                     --base "$BASE" --head "$HEAD" --per-test "$PER_TEST" --classes "$CLASSES" 2>/dev/null || true)
-    else
-      while IFS= read -r t; do
-        [[ -n "$t" ]] && ALL["$t"]=1
-      done < <("$TG" impacted --csv --db "$DB" --configfile "$REPO/$f" 2>/dev/null || true)
-    fi
+    # Method-level `refine --configfile` reads line coverage straight from the index and
+    # degrades to the class-level `impacted --configfile` set when coverage is absent.
+    while IFS= read -r t; do
+      [[ -n "$t" ]] && ALL["$t"]=1
+    done < <("$TG" refine --csv --db "$DB" --configfile "$REPO/$f" \
+                   --base "$BASE" --head "$HEAD" 2>/dev/null || true)
   fi
 done
 

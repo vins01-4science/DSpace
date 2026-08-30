@@ -5,6 +5,7 @@
  *
  * http://www.dspace.org/license/
  */
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -15,6 +16,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,9 +31,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 import org.jacoco.core.analysis.Analyzer;
 import org.jacoco.core.analysis.ICoverageVisitor;
@@ -546,6 +552,233 @@ public class TestGraph {
         return m.find() ? m.group(1) : null;
     }
 
+    // ------------------------------------------------- compact coverage codec
+
+    /** Accumulates one class's coverage blob while tests are streamed in. */
+    private static final class Buf {
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        int lastTest = 0;
+    }
+
+    private static void putVarint(ByteArrayOutputStream o, int v) {
+        while ((v & ~0x7F) != 0) { o.write((v & 0x7F) | 0x80); v >>>= 7; }
+        o.write(v);
+    }
+
+    /** @return {value, newPosition} */
+    private static int[] readVarint(byte[] b, int p) {
+        int v = 0, shift = 0, r;
+        do {
+            r = b[p++] & 0xFF;
+            v |= (r & 0x7F) << shift;
+            shift += 7;
+        } while ((r & 0x80) != 0);
+        return new int[]{v, p};
+    }
+
+    private static byte[] deflate(byte[] in) {
+        Deflater d = new Deflater(Deflater.BEST_COMPRESSION);
+        d.setInput(in);
+        d.finish();
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        byte[] buf = new byte[65536];
+        while (!d.finished()) {
+            int n = d.deflate(buf);
+            o.write(buf, 0, n);
+        }
+        d.end();
+        return o.toByteArray();
+    }
+
+    private static byte[] inflate(byte[] in) {
+        Inflater inf = new Inflater();
+        inf.setInput(in);
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        byte[] buf = new byte[65536];
+        try {
+            while (!inf.finished()) {
+                int n = inf.inflate(buf);
+                if (n == 0) {
+                    if (inf.needsInput() || inf.needsDictionary()) break;
+                }
+                o.write(buf, 0, n);
+            }
+        } catch (DataFormatException e) {
+            return new byte[0];
+        } finally {
+            inf.end();
+        }
+        return o.toByteArray();
+    }
+
+    /**
+     * Query-side view of the index. The {@code impact} table is not stored: it is
+     * derived on demand by walking {@code class_refs} backwards from the changed
+     * class and reading the compact per-class coverage blobs.
+     */
+    private static final class Index {
+        final Connection c;
+        private Map<String, Set<String>> refs;
+        private Map<String, Set<String>> preds;
+        private Map<Integer, String> testNames;
+        private Map<String, Integer> classIds;
+        private Set<String> tables;
+        private final Map<String, Map<String, Set<Integer>>> blobCache = new HashMap<>();
+
+        Index(Connection c) { this.c = c; }
+
+        private void loadRefs() throws SQLException {
+            if (refs != null) return;
+            refs = new HashMap<>();
+            preds = new HashMap<>();
+            try (PreparedStatement ps = c.prepareStatement("SELECT from_c, to_c FROM class_refs");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String f = rs.getString(1), t = rs.getString(2);
+                    refs.computeIfAbsent(f, k -> new HashSet<>()).add(t);
+                    preds.computeIfAbsent(t, k -> new HashSet<>()).add(f);
+                }
+            }
+        }
+
+        private Set<String> tables() throws SQLException {
+            if (tables == null) {
+                tables = new HashSet<>();
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT name FROM sqlite_master WHERE type='table'");
+                     ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) tables.add(rs.getString(1));
+                }
+            }
+            return tables;
+        }
+
+        private Map<Integer, String> testNames() throws SQLException {
+            if (testNames == null) {
+                testNames = new HashMap<>();
+                if (tables().contains("cov_test")) {
+                    try (PreparedStatement ps = c.prepareStatement("SELECT id, name FROM cov_test");
+                         ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) testNames.put(rs.getInt(1), rs.getString(2));
+                    }
+                }
+            }
+            return testNames;
+        }
+
+        private Map<String, Integer> classIds() throws SQLException {
+            if (classIds == null) {
+                classIds = new HashMap<>();
+                if (tables().contains("cov_class")) {
+                    try (PreparedStatement ps = c.prepareStatement("SELECT id, name FROM cov_class");
+                         ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) classIds.put(rs.getString(2), rs.getInt(1));
+                    }
+                }
+            }
+            return classIds;
+        }
+
+        /** test name -> covered lines, for a single class. Empty when unknown. */
+        Map<String, Set<Integer>> lines(String fqcn) throws SQLException {
+            Map<String, Set<Integer>> cached = blobCache.get(fqcn);
+            if (cached != null) return cached;
+            Map<String, Set<Integer>> out = new HashMap<>();
+            Integer id = classIds().get(fqcn);
+            if (id != null && tables().contains("cov_data")) {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT blob FROM cov_data WHERE class_id = ?")) {
+                    ps.setInt(1, id);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            byte[] raw = rs.getBytes(1);
+                            if (raw != null) decode(raw, out);
+                        }
+                    }
+                }
+            }
+            blobCache.put(fqcn, out);
+            return out;
+        }
+
+        private void decode(byte[] raw, Map<String, Set<Integer>> out) throws SQLException {
+            decodeRaw(raw, testNames(), out);
+        }
+
+        /**
+         * Tests impacted by a change to {@code fqcn}. When {@code direct} is true the
+         * transitive reference closure is skipped (used for config changes, where the
+         * consumer class itself is the thing that changed).
+         */
+        Set<String> impacted(String fqcn, boolean direct) throws SQLException {
+            Set<String> scope = new HashSet<>();
+            scope.add(fqcn);
+            if (!direct) {
+                loadRefs();
+                Deque<String> stack = new ArrayDeque<>(preds.getOrDefault(fqcn, Set.of()));
+                while (!stack.isEmpty()) {
+                    String n = stack.pop();
+                    if (!scope.add(n)) continue;
+                    for (String m : preds.getOrDefault(n, Set.of())) {
+                        if (!scope.contains(m)) stack.push(m);
+                    }
+                }
+            }
+            Set<String> out = new HashSet<>();
+            for (String cls : scope) out.addAll(lines(cls).keySet());
+            return out;
+        }
+    }
+
+    /**
+     * Decode one class blob into {@code out} (test name -> covered lines).
+     * Shared by {@link Index#lines} and by {@code aggregate}, which merges
+     * shards one class at a time instead of materialising every blob at once.
+     */
+    private static void decodeRaw(byte[] raw, Map<Integer, String> testNames,
+                                  Map<String, Set<Integer>> out) {
+        byte[] b = inflate(raw);
+        int p = 0, lastTest = 0;
+        while (p < b.length) {
+            int[] r1 = readVarint(b, p); lastTest += r1[0]; p = r1[1];
+            if (p > b.length) break;
+            int[] r2 = readVarint(b, p); int n = r2[0]; p = r2[1];
+            Set<Integer> ls = new TreeSet<>();
+            int prev = 0;
+            for (int i = 0; i < n; i++) {
+                if (p > b.length) break;
+                int[] r3 = readVarint(b, p); prev += r3[0]; p = r3[1];
+                ls.add(prev);
+            }
+            String name = testNames.get(lastTest);
+            if (name != null) out.put(name, ls);
+        }
+    }
+
+    /**
+     * Encode (test -> covered lines) for one class into a deflated blob.
+     * Global test ids must be assigned in test-name order, matching the TreeMap
+     * iteration below, so every delta {@code id - last} stays non-negative.
+     */
+    private static byte[] encodeCoverage(Map<String, Set<Integer>> byTest,
+                                         Map<String, Integer> testIds) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        int last = 0;
+        for (Map.Entry<String, Set<Integer>> e : new TreeMap<>(byTest).entrySet()) {
+            Integer id = testIds.get(e.getKey());
+            if (id == null) continue;
+            putVarint(o, id - last);
+            last = id;
+            putVarint(o, e.getValue().size());
+            int prev = 0;
+            for (int l : e.getValue()) {
+                putVarint(o, l - prev);
+                prev = l;
+            }
+        }
+        return deflate(o.toByteArray());
+    }
+
     // ------------------------------------------------------------------ build
 
     private static void buildCmd(Map<String, String> opts) throws Exception {
@@ -558,6 +791,15 @@ public class TestGraph {
                 module.resolve("target/test-graph").toString()));
         Path db = Paths.get(opts.getOrDefault("db",
                 module.resolve("target/test-graph/impact-index.sqlite").toString()));
+        // Compiled class roots to analyze for line coverage. Test classes live in
+        // target/test-classes and routinely read property keys / intercept calls,
+        // so coverage of them must be captured or aggregate loses property impact
+        // (e.g. a key read only by S3BitStoreServiceIT).
+        List<Path> classDirs = new ArrayList<>();
+        for (String d : opts.getOrDefault("classes",
+                module.resolve("target/classes").toString()).split(File.pathSeparator)) {
+            if (!d.isEmpty()) classDirs.add(Paths.get(d));
+        }
         Files.createDirectories(db.getParent());
 
         // 1) static reference graph (DSpace-only)
@@ -568,24 +810,88 @@ public class TestGraph {
             refs.computeIfAbsent(parts[0], k -> new HashSet<>()).add(parts[1]);
         }
 
-        // 2) per-test runtime coverage
+        // 2) per-test runtime coverage.
+        //    `covered` (test -> classes) is kept in memory only; it drives the impact
+        //    closure below and is never written to the index.
+        //    `byClass` (class -> encoded test/line blob) is what gets stored: it
+        //    replaces both the old `test_covers` and `impact` tables and additionally
+        //    carries per-line detail, so `refine` no longer needs the raw .exec files.
         Map<String, Set<String>> covered = new HashMap<>();
+        Map<String, Buf> byClass = new TreeMap<>();
+        List<String> testNames = new ArrayList<>();
         if (Files.exists(perTest)) {
+            List<Path> execs;
             try (var stream = Files.walk(perTest)) {
-                for (Path exec : stream.filter(f -> f.toString().endsWith(".exec")).toList()) {
-                    if (Files.size(exec) == 0) continue;
-                    String key = exec.getFileName().toString();
-                    key = key.substring(0, key.length() - ".exec".length());
-                    Set<String> set = covered.computeIfAbsent(key, k -> new HashSet<>());
-                    ExecFileLoader loader = new ExecFileLoader();
-                    loader.load(exec.toFile());
-                    ExecutionDataStore store = loader.getExecutionDataStore();
-                    for (ExecutionData ed : store.getContents()) {
-                        if (!ed.hasHits()) continue;
-                        String n = ed.getName().replace('/', '.');
-                        int d = n.indexOf('$');
-                        if (d >= 0) n = n.substring(0, d);
-                        set.add(n);
+                execs = stream.filter(f -> f.toString().endsWith(".exec")).sorted().toList();
+            }
+            for (Path exec : execs) {
+                if (Files.size(exec) == 0) continue;
+                String key = exec.getFileName().toString();
+                key = key.substring(0, key.length() - ".exec".length());
+                Set<String> set = covered.computeIfAbsent(key, k -> new HashSet<>());
+                ExecFileLoader loader = new ExecFileLoader();
+                loader.load(exec.toFile());
+                ExecutionDataStore store = loader.getExecutionDataStore();
+                boolean any = false;
+                for (ExecutionData ed : store.getContents()) {
+                    if (!ed.hasHits()) continue;
+                    String n = ed.getName().replace('/', '.');
+                    int d = n.indexOf('$');
+                    if (d >= 0) n = n.substring(0, d);
+                    set.add(n);
+                    any = true;
+                }
+                if (!any) continue;
+                int testId = testNames.size();
+                testNames.add(key);
+                // Line-level detail, project classes only. Third-party classes can
+                // never change, so storing their lines was pure dead weight (77% of
+                // the old `impact` table).
+                Map<String, Set<Integer>> lines = new TreeMap<>();
+                try {
+                    Analyzer an = new Analyzer(store, new ICoverageVisitor() {
+                        public void visitCoverage(IClassCoverage cc) {
+                            String n = cc.getName().replace('/', '.');
+                            if (!n.startsWith("org.dspace.")) return;
+                            int d = n.indexOf('$');
+                            if (d >= 0) n = n.substring(0, d);
+                            TreeSet<Integer> ls = new TreeSet<>();
+                            for (IMethodCoverage m : cc.getMethods()) {
+                                int a = m.getFirstLine(), b = m.getLastLine();
+                                if (a < 0 || b < 0) continue;
+                                for (int i = a; i <= b; i++) {
+                                    // Must test the COVERED counter, not the status:
+                                    // a line with code that this test never executed is
+                                    // NOT_COVERED, which is != EMPTY, so a status test
+                                    // records every compiled class as fully covered by
+                                    // every test and destroys all refinement signal.
+                                    ILine ctr = m.getLine(i);
+                                    if (ctr != null
+                                            && ctr.getInstructionCounter().getCoveredCount() > 0) {
+                                        ls.add(i);
+                                    }
+                                }
+                            }
+                            if (!ls.isEmpty()) {
+                                lines.computeIfAbsent(n, k -> new TreeSet<>()).addAll(ls);
+                            }
+                        }
+                    });
+                    for (Path dir : classDirs) {
+                        an.analyzeAll(dir.toFile());
+                    }
+                } catch (IOException e) {
+                    // no/unreadable compiled classes: fall back to class-level coverage only
+                }
+                for (Map.Entry<String, Set<Integer>> e : lines.entrySet()) {
+                    Buf buf = byClass.computeIfAbsent(e.getKey(), k -> new Buf());
+                    putVarint(buf.b, testId - buf.lastTest);
+                    buf.lastTest = testId;
+                    putVarint(buf.b, e.getValue().size());
+                    int prev = 0;
+                    for (int ln : e.getValue()) {
+                        putVarint(buf.b, ln - prev);
+                        prev = ln;
                     }
                 }
             }
@@ -623,12 +929,27 @@ public class TestGraph {
             }
         }
 
-        // 4) reverse impact closure: class -> tests whose covered set reaches it
-        Map<String, Set<String>> impact = new HashMap<>();
+        // 4) impact closure. The old `impact` table (class -> tests) stood at 426 MB and
+        //    is no longer stored: `Index.impacted()` re-derives it at query time from
+        //    cov_data + class_refs, and was verified to reproduce the stored rows exactly
+        //    for every project class. Here we only need the *set* of impacted class names
+        //    for reporting, plus class -> tests for the property pass below.
+        Map<String, Set<String>> testsByClass = new HashMap<>();
         for (Map.Entry<String, Set<String>> e : covered.entrySet()) {
-            String test = e.getKey();
+            for (String cls : e.getValue()) {
+                testsByClass.computeIfAbsent(cls, k -> new HashSet<>()).add(e.getKey());
+            }
+        }
+        Map<String, Set<String>> preds = new HashMap<>();
+        for (Map.Entry<String, Set<String>> e : refs.entrySet()) {
+            for (String to : e.getValue()) {
+                preds.computeIfAbsent(to, k -> new HashSet<>()).add(e.getKey());
+            }
+        }
+        Set<String> impactedClasses = new HashSet<>();
+        for (Set<String> cov : covered.values()) {
             Set<String> closure = new HashSet<>();
-            Deque<String> stack = new ArrayDeque<>(e.getValue());
+            Deque<String> stack = new ArrayDeque<>(cov);
             while (!stack.isEmpty()) {
                 String n = stack.pop();
                 if (!closure.add(n)) continue;
@@ -639,17 +960,14 @@ public class TestGraph {
                     }
                 }
             }
-            for (String cls : closure) {
-                impact.computeIfAbsent(cls, k -> new HashSet<>()).add(test);
-            }
+            impactedClasses.addAll(closure);
         }
 
         // 5) property_impact: key -> tests (via property_refs -> class -> tests)
         Map<String, Set<String>> propImpact = new HashMap<>();
         for (String[] pr : propRefs) {
-            String cls = topLevel(pr[0]);
-            Set<String> tests = impact.get(cls);
-            if (tests != null) {
+            Set<String> tests = reverseImpact(topLevel(pr[0]), preds, testsByClass);
+            if (!tests.isEmpty()) {
                 propImpact.computeIfAbsent(pr[1], k -> new HashSet<>()).addAll(tests);
             }
         }
@@ -658,13 +976,17 @@ public class TestGraph {
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             c.setAutoCommit(false);
+            // test_covers/impact are legacy names from the pre-compact format; dropping
+            // them keeps old indexes from being half-migrated.
             String[] drops = {"class_refs", "test_covers", "impact",
+                    "cov_test", "cov_class", "cov_data",
                     "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
                     "config_consumers"};
             for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
             c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
-            c.createStatement().execute("CREATE TABLE test_covers(test TEXT, class TEXT)");
-            c.createStatement().execute("CREATE TABLE impact(class TEXT, test TEXT)");
+            c.createStatement().execute("CREATE TABLE cov_test(id INTEGER PRIMARY KEY, name TEXT)");
+            c.createStatement().execute("CREATE TABLE cov_class(id INTEGER PRIMARY KEY, name TEXT)");
+            c.createStatement().execute("CREATE TABLE cov_data(class_id INTEGER PRIMARY KEY, blob BLOB)");
             c.createStatement().execute("CREATE TABLE property_refs(from_c TEXT, key TEXT, kind TEXT)");
             c.createStatement().execute("CREATE TABLE bean_refs(from_c TEXT, ref TEXT, kind TEXT)");
             c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
@@ -672,14 +994,15 @@ public class TestGraph {
             c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
             c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
             try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
-                 PreparedStatement ps2 = c.prepareStatement("INSERT INTO test_covers VALUES (?,?)");
-                 PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)");
-                 PreparedStatement ps4 = c.prepareStatement("INSERT INTO property_refs VALUES (?,?,?)");
-                 PreparedStatement ps5 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
-                 PreparedStatement ps6 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
-                 PreparedStatement ps7 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
-                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)");
-                 PreparedStatement ps9 = c.prepareStatement("INSERT INTO config_consumers VALUES (?,?)")) {
+                 PreparedStatement ps2 = c.prepareStatement("INSERT INTO cov_test VALUES (?,?)");
+                 PreparedStatement ps3 = c.prepareStatement("INSERT INTO cov_class VALUES (?,?)");
+                 PreparedStatement ps4 = c.prepareStatement("INSERT INTO cov_data VALUES (?,?)");
+                 PreparedStatement ps5 = c.prepareStatement("INSERT INTO property_refs VALUES (?,?,?)");
+                 PreparedStatement ps6 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
+                 PreparedStatement ps7 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
+                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
+                 PreparedStatement ps9 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)");
+                 PreparedStatement ps10 = c.prepareStatement("INSERT INTO config_consumers VALUES (?,?)")) {
                 for (Map.Entry<String, Set<String>> e : refs.entrySet()) {
                     for (String to : e.getValue()) {
                         ps1.setString(1, e.getKey());
@@ -688,54 +1011,77 @@ public class TestGraph {
                         ps1.addBatch();
                     }
                 }
-                for (Map.Entry<String, Set<String>> e : covered.entrySet()) {
-                    for (String cls : e.getValue()) {
-                        ps2.setString(1, e.getKey());
-                        ps2.setString(2, cls);
-                        ps2.addBatch();
-                    }
+                for (int i = 0; i < testNames.size(); i++) {
+                    ps2.setInt(1, i);
+                    ps2.setString(2, testNames.get(i));
+                    ps2.addBatch();
                 }
-                for (Map.Entry<String, Set<String>> e : impact.entrySet()) {
-                    for (String test : e.getValue()) {
-                        ps3.setString(1, e.getKey());
-                        ps3.setString(2, test);
-                        ps3.addBatch();
-                    }
+                int cid = 0;
+                for (Map.Entry<String, Buf> e : byClass.entrySet()) {
+                    ps3.setInt(1, cid);
+                    ps3.setString(2, e.getKey());
+                    ps3.addBatch();
+                    ps4.setInt(1, cid);
+                    ps4.setBytes(2, deflate(e.getValue().b.toByteArray()));
+                    ps4.addBatch();
+                    cid++;
                 }
                 for (String[] r : propRefs) {
-                    ps4.setString(1, r[0]); ps4.setString(2, r[1]); ps4.setString(3, r[2]); ps4.addBatch();
+                    ps5.setString(1, r[0]); ps5.setString(2, r[1]); ps5.setString(3, r[2]); ps5.addBatch();
                 }
                 for (String[] r : beanRefs) {
-                    ps5.setString(1, r[0]); ps5.setString(2, r[1]); ps5.setString(3, r[2]); ps5.addBatch();
+                    ps6.setString(1, r[0]); ps6.setString(2, r[1]); ps6.setString(3, r[2]); ps6.addBatch();
                 }
                 for (String[] r : configKeys) {
                     if (r.length < 2) continue;
-                    ps6.setString(1, r[0]); ps6.setString(2, r[1]); ps6.addBatch();
+                    ps7.setString(1, r[0]); ps7.setString(2, r[1]); ps7.addBatch();
                 }
                 for (String[] r : beanDecls) {
-                    ps7.setString(1, r[0]); ps7.setString(2, r[1]);
-                    ps7.setString(3, r.length > 2 ? r[2] : ""); ps7.addBatch();
+                    ps8.setString(1, r[0]); ps8.setString(2, r[1]);
+                    ps8.setString(3, r.length > 2 ? r[2] : ""); ps8.addBatch();
                 }
                 for (Map.Entry<String, Set<String>> e : propImpact.entrySet()) {
                     for (String test : e.getValue()) {
-                        ps8.setString(1, e.getKey());
-                        ps8.setString(2, test);
-                        ps8.addBatch();
+                        ps9.setString(1, e.getKey());
+                        ps9.setString(2, test);
+                        ps9.addBatch();
                     }
                 }
                 for (String[] r : configConsumers) {
                     if (r.length < 2) continue;
-                    ps9.setString(1, r[0]); ps9.setString(2, r[1]); ps9.addBatch();
+                    ps10.setString(1, r[0]); ps10.setString(2, r[1]); ps10.addBatch();
                 }
-                ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
-                ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
-                ps7.executeBatch(); ps8.executeBatch(); ps9.executeBatch();
+                ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch(); ps4.executeBatch();
+                ps5.executeBatch(); ps6.executeBatch(); ps7.executeBatch();
+                ps8.executeBatch(); ps9.executeBatch(); ps10.executeBatch();
             }
             c.commit();
         }
         System.out.println("build: " + covered.size() + " tests, " + refs.size()
-                + " classes-in-graph, " + impact.size() + " impacted classes, "
-                + propImpact.size() + " impacted properties -> " + db);
+                + " classes-in-graph, " + impactedClasses.size() + " impacted classes, "
+                + propImpact.size() + " impacted properties, "
+                + byClass.size() + " classes with line coverage -> " + db);
+    }
+
+    /** Tests whose covered set reaches {@code fqcn} through the reference graph. */
+    private static Set<String> reverseImpact(String fqcn, Map<String, Set<String>> preds,
+                                             Map<String, Set<String>> testsByClass) {
+        Set<String> scope = new HashSet<>();
+        scope.add(fqcn);
+        Deque<String> stack = new ArrayDeque<>(preds.getOrDefault(fqcn, Set.of()));
+        while (!stack.isEmpty()) {
+            String n = stack.pop();
+            if (!scope.add(n)) continue;
+            for (String m : preds.getOrDefault(n, Set.of())) {
+                if (!scope.contains(m)) stack.push(m);
+            }
+        }
+        Set<String> out = new HashSet<>();
+        for (String cls : scope) {
+            Set<String> t = testsByClass.get(cls);
+            if (t != null) out.addAll(t);
+        }
+        return out;
     }
 
     private static String topLevel(String fqcn) {
@@ -755,6 +1101,7 @@ public class TestGraph {
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             Set<String> tests = new TreeSet<>();
+            Index idx = new Index(c);
             if (opts.containsKey("property")) {
                 String key = opts.get("property");
                 try (PreparedStatement ps = c.prepareStatement(
@@ -787,14 +1134,7 @@ public class TestGraph {
                         setFileParam(psC, path);
                         try (ResultSet rsC = psC.executeQuery()) {
                             while (rsC.next()) {
-                                String cls = rsC.getString(1);
-                                try (PreparedStatement psT = c.prepareStatement(
-                                        "SELECT test FROM impact WHERE class = ?")) {
-                                    psT.setString(1, cls);
-                                    try (ResultSet rsT = psT.executeQuery()) {
-                                        while (rsT.next()) tests.add(rsT.getString(1));
-                                    }
-                                }
+                                tests.addAll(idx.impacted(rsC.getString(1), false));
                             }
                         }
                     }
@@ -820,14 +1160,8 @@ public class TestGraph {
                     if (!csv) System.err.println("Bean: " + bean + " -> (no matching bean type)");
                     return;
                 }
-                try (PreparedStatement ps = c.prepareStatement(
-                        "SELECT test FROM impact WHERE class = ?")) {
-                    for (String t : types) {
-                        ps.setString(1, t);
-                        try (ResultSet rs = ps.executeQuery()) {
-                            while (rs.next()) tests.add(rs.getString(1));
-                        }
-                    }
+                for (String t : types) {
+                    tests.addAll(idx.impacted(t, false));
                 }
                 emit(tests, csv, "Bean: " + bean + (type == null ? " (id)" : " (type)"));
             } else if (opts.containsKey("beanfile")) {
@@ -844,14 +1178,8 @@ public class TestGraph {
                     if (!csv) System.err.println("Bean file: " + path + " -> (no bean declarations indexed)");
                     return;
                 }
-                try (PreparedStatement ps = c.prepareStatement(
-                        "SELECT test FROM impact WHERE class = ?")) {
-                    for (String t : types) {
-                        ps.setString(1, t);
-                        try (ResultSet rs = ps.executeQuery()) {
-                            while (rs.next()) tests.add(rs.getString(1));
-                        }
-                    }
+                for (String t : types) {
+                    tests.addAll(idx.impacted(t, false));
                 }
                 emit(tests, csv, "Bean file: " + path);
             } else {
@@ -862,13 +1190,7 @@ public class TestGraph {
                             + "src/main/java or src/test/java, or the fully-qualified class name.");
                     System.exit(1);
                 }
-                try (PreparedStatement ps = c.prepareStatement(
-                        "SELECT test FROM impact WHERE class = ? ORDER BY test")) {
-                    ps.setString(1, fqcn);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) tests.add(rs.getString(1));
-                    }
-                }
+                tests.addAll(idx.impacted(fqcn, false));
                 emit(tests, csv, "Changed class: " + fqcn);
             }
         }
@@ -928,7 +1250,6 @@ public class TestGraph {
         Path db = Paths.get(require(opts, "db"));
         Path perTest = opts.containsKey("per-test") ? Paths.get(opts.get("per-test")) : null;
         Path classesDir = opts.containsKey("classes") ? Paths.get(opts.get("classes")) : null;
-        boolean haveCoverage = perTest != null && classesDir != null;
 
         List<String> diffLines;
         if (opts.containsKey("diff")) {
@@ -997,35 +1318,27 @@ public class TestGraph {
 
         Class.forName("org.sqlite.JDBC");
         Set<String> candidates = new TreeSet<>();
+        Set<String> inScope = new TreeSet<>();
+        Map<String, Set<String>> touchedMethods = new HashMap<>();
         Set<String> configClasses = new TreeSet<>();
         configClasses.addAll(methodLinesMap.keySet());
         configClasses.addAll(classOnly);
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+            Index idx = new Index(c);
+            // Coverage now lives inside the index (cov_data), so refinement no longer needs
+            // the raw per-test .exec files or a compiled-classes directory to narrow.
+            boolean haveCoverage = idx.tables().contains("cov_data");
             for (String fqcn : candidateClasses) {
                 boolean isCfg = configClasses.contains(fqcn);
-                // config changes: prefer DIRECT coverage (test_covers) so we don't explode via the
-                // transitive reference closure; fall back to impact when nothing is directly covered.
-                String tbl = (isCfg && haveCoverage) ? "test_covers" : "impact";
-                try (PreparedStatement ps = c.prepareStatement("SELECT test FROM " + tbl + " WHERE class = ?")) {
-                    ps.setString(1, topLevel(fqcn));
-                    try (ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) candidates.add(rs.getString(1));
-                    }
-                }
-                if (isCfg && haveCoverage && !candidates.isEmpty()) {
-                    // direct coverage found; keep it (precise)
-                } else if (isCfg && haveCoverage) {
-                    try (PreparedStatement ps = c.prepareStatement("SELECT test FROM impact WHERE class = ?")) {
-                        ps.setString(1, topLevel(fqcn));
-                        try (ResultSet rs = ps.executeQuery()) {
-                            while (rs.next()) candidates.add(rs.getString(1));
-                        }
-                    }
-                }
+                // config changes: prefer DIRECT coverage so we don't explode via the
+                // transitive reference closure; fall back to the full closure when
+                // nothing is directly covered.
+                Set<String> ts = idx.impacted(topLevel(fqcn), isCfg);
+                if (isCfg && ts.isEmpty()) ts = idx.impacted(topLevel(fqcn), false);
+                candidates.addAll(ts);
             }
-        }
 
-        if (!haveCoverage) {
+            if (!haveCoverage) {
             // No per-test exec / compiled classes: degrade to class-level union (same set as
             // `impacted --configfile`), never a false negative vs the class-level impact.
             if (opts.containsKey("csv")) { candidates.forEach(System.out::println); return; }
@@ -1033,7 +1346,7 @@ public class TestGraph {
                     + candidates.size() + " tests (class-level union; no per-test coverage available)");
             System.out.println("Changed classes: " + candidateClasses);
             if (!methodLinesMap.isEmpty()) {
-                System.out.println("Resolved consumer method line ranges (pass --per-test + --classes to narrow):");
+                System.out.println("Resolved consumer method line ranges (rebuild the index with per-test line coverage to narrow):");
                 methodLinesMap.forEach((k, v) -> {
                     int lo = Collections.min(v), hi = Collections.max(v);
                     System.out.println("  " + k + " [" + lo + "-" + hi + "] (" + v.size() + " lines)");
@@ -1045,29 +1358,28 @@ public class TestGraph {
             return;
         }
 
-        Set<String> inScope = new TreeSet<>();
-        Map<String, Set<String>> touchedMethods = new HashMap<>();
-        for (String test : candidates) {
-            boolean hit = false;
-            for (String fqcn : javaChanged.keySet()) {
-                RefineHit rh = coversChangedLines(perTest, classesDir, test, topLevel(fqcn), javaChanged.get(fqcn));
-                if (rh.hit) {
-                    hit = true;
-                    if (!rh.methods.isEmpty())
-                        touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(rh.methods);
+            for (String test : candidates) {
+                boolean hit = false;
+                for (String fqcn : javaChanged.keySet()) {
+                    Set<String> ms = hitsMethods(idx, classesDir, test, topLevel(fqcn), javaChanged.get(fqcn));
+                    if (ms != null) {
+                        hit = true;
+                        if (!ms.isEmpty())
+                            touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(ms);
+                    }
                 }
-            }
-            // class-level config consumers: candidate already came from direct coverage -> include
-            if (!classOnly.isEmpty()) hit = true;
-            for (String fqcn : methodLinesMap.keySet()) {
-                RefineHit rh = coversChangedLines(perTest, classesDir, test, topLevel(fqcn), methodLinesMap.get(fqcn));
-                if (rh.hit) {
-                    hit = true;
-                    if (!rh.methods.isEmpty())
-                        touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(rh.methods);
+                // class-level config consumers: candidate already came from direct coverage -> include
+                if (!classOnly.isEmpty()) hit = true;
+                for (String fqcn : methodLinesMap.keySet()) {
+                    Set<String> ms = hitsMethods(idx, classesDir, test, topLevel(fqcn), methodLinesMap.get(fqcn));
+                    if (ms != null) {
+                        hit = true;
+                        if (!ms.isEmpty())
+                            touchedMethods.computeIfAbsent(test, k -> new TreeSet<>()).addAll(ms);
+                    }
                 }
+                if (hit) inScope.add(test);
             }
-            if (hit) inScope.add(test);
         }
 
         if (opts.containsKey("csv")) {
@@ -1278,6 +1590,56 @@ public class TestGraph {
         return s;
     }
 
+    /**
+     * Does {@code test} cover any of {@code changedLines} in {@code cls}?
+     *
+     * @return the methods of {@code cls} containing those lines, or null when the test
+     *         does not cover any changed line (i.e. it can be dropped from the run).
+     */
+    private static Set<String> hitsMethods(Index idx, Path classesDir, String test,
+                                           String cls, Set<Integer> changedLines) throws SQLException {
+        if (changedLines == null || changedLines.isEmpty()) return null;
+        Set<Integer> covered = idx.lines(cls).get(test);
+        if (covered == null) return null;
+        boolean hit = false;
+        for (int l : changedLines) {
+            if (covered.contains(l)) { hit = true; break; }
+        }
+        if (!hit) return null;
+        return classesDir == null ? Set.of() : methodNamesFor(classesDir, cls, changedLines);
+    }
+
+    /** Names of the methods of {@code cls} whose line range contains any of {@code lines}. */
+    private static Set<String> methodNamesFor(Path classesDir, String fqcn, Set<Integer> lines) {
+        Set<String> out = new TreeSet<>();
+        Path cf = classesDir.resolve(fqcn.replace('.', '/') + ".class");
+        if (!Files.exists(cf)) return out;
+        try {
+            byte[] b = Files.readAllBytes(cf);
+            new ClassReader(b).accept(new ClassVisitor(Opcodes.ASM9) {
+                public MethodVisitor visitMethod(int access, String name, String desc,
+                                                 String sig, String[] ex) {
+                    int[] r = {-1, -1};
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        public void visitLineNumber(int ln, Label label) {
+                            if (r[0] < 0) r[0] = ln;
+                            if (ln > r[1]) r[1] = ln;
+                        }
+                        public void visitEnd() {
+                            if (r[0] < 0) return;
+                            for (int l : lines) {
+                                if (l >= r[0] && l <= r[1]) { out.add(name); return; }
+                            }
+                        }
+                    };
+                }
+            }, 0);
+        } catch (Exception e) {
+            return out;
+        }
+        return out;
+    }
+
     // -------------------------------------------------------------- aggregate
 
     private static void aggregateCmd(Map<String, String> opts) throws Exception {
@@ -1291,13 +1653,12 @@ public class TestGraph {
         Path out = Paths.get(require(opts, "out"));
         Files.createDirectories(out.getParent());
 
-        Map<String, Set<String>> impact = new HashMap<>();
-        Map<String, Set<String>> covers = new HashMap<>();
         Map<String, Set<String>> refs = new HashMap<>();
         // Deduped: when merging shards of the *same* module, the module-level
         // static/config rows are repeated in every partial index, so they must
-        // collapse here. impact/test_covers/class_refs already dedup via maps,
-        // and property_impact is recomputed below from the merged set.
+        // collapse here. class_refs dedups via the map, coverage is merged one
+        // class at a time below, and property_impact is recomputed from the
+        // merged coverage instead of being carried over row by row.
         Set<List<String>> propRefs = new LinkedHashSet<>();
         Set<List<String>> beanRefs = new LinkedHashSet<>();
         Set<List<String>> configKeys = new LinkedHashSet<>();
@@ -1305,70 +1666,147 @@ public class TestGraph {
         Set<List<String>> configConsumers = new LinkedHashSet<>();
 
         Class.forName("org.sqlite.JDBC");
-        for (Path db : dbs) {
-            try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
-                mergeMap(c, "SELECT class, test FROM impact", impact);
-                mergeMap(c, "SELECT test, class FROM test_covers", covers);
-                mergeMap(c, "SELECT from_c, to_c FROM class_refs", refs);
-                for (String[] r : readDb(c, "SELECT from_c, key, kind FROM property_refs")) propRefs.add(Arrays.asList(r));
-                for (String[] r : readDb(c, "SELECT from_c, ref, kind FROM bean_refs")) beanRefs.add(Arrays.asList(r));
-                for (String[] r : readDb(c, "SELECT file, key FROM config_keys")) configKeys.add(Arrays.asList(r));
-                for (String[] r : readDb(c, "SELECT file, bean_type, bean_id FROM bean_decls")) beanDecls.add(Arrays.asList(r));
-                for (String[] r : readDb(c, "SELECT file, class FROM config_consumers")) configConsumers.add(Arrays.asList(r));
-            }
-        }
 
+        // Source connections stay open for both passes: pass B re-queries them
+        // once per class, and reconnecting per (class x shard) would dominate.
+        List<Connection> src = new ArrayList<>();
+        List<Map<Integer, String>> localNames = new ArrayList<>();
+        Set<String> allTests = new TreeSet<>();
+        Set<String> allClasses = new TreeSet<>();
         Map<String, Set<String>> propImpact = new HashMap<>();
-        for (List<String> pr : propRefs) {
-            Set<String> tests = impact.get(topLevel(pr.get(0)));
-            if (tests != null) propImpact.computeIfAbsent(pr.get(1), k -> new HashSet<>()).addAll(tests);
-        }
-
-        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out)) {
-            c.setAutoCommit(false);
-            String[] drops = {"class_refs", "test_covers", "impact",
-                    "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
-                    "config_consumers"};
-            for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
-            c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
-            c.createStatement().execute("CREATE TABLE test_covers(test TEXT, class TEXT)");
-            c.createStatement().execute("CREATE TABLE impact(class TEXT, test TEXT)");
-            c.createStatement().execute("CREATE TABLE property_refs(from_c TEXT, key TEXT, kind TEXT)");
-            c.createStatement().execute("CREATE TABLE bean_refs(from_c TEXT, ref TEXT, kind TEXT)");
-            c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
-            c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
-            c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
-            c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
-            try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
-                 PreparedStatement ps2 = c.prepareStatement("INSERT INTO test_covers VALUES (?,?)");
-                 PreparedStatement ps3 = c.prepareStatement("INSERT INTO impact VALUES (?,?)");
-                 PreparedStatement ps4 = c.prepareStatement("INSERT INTO property_refs VALUES (?,?,?)");
-                 PreparedStatement ps5 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
-                 PreparedStatement ps6 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
-                 PreparedStatement ps7 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
-                 PreparedStatement ps8 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)");
-                 PreparedStatement ps9 = c.prepareStatement("INSERT INTO config_consumers VALUES (?,?)")) {
-                for (Map.Entry<String, Set<String>> e : refs.entrySet())
-                    for (String to : e.getValue()) { ps1.setString(1, e.getKey()); ps1.setString(2, to); ps1.setString(3, "reference"); ps1.addBatch(); }
-                for (Map.Entry<String, Set<String>> e : covers.entrySet())
-                    for (String cls : e.getValue()) { ps2.setString(1, e.getKey()); ps2.setString(2, cls); ps2.addBatch(); }
-                for (Map.Entry<String, Set<String>> e : impact.entrySet())
-                    for (String t : e.getValue()) { ps3.setString(1, e.getKey()); ps3.setString(2, t); ps3.addBatch(); }
-                for (List<String> r : propRefs) { ps4.setString(1, r.get(0)); ps4.setString(2, r.get(1)); ps4.setString(3, r.get(2)); ps4.addBatch(); }
-                for (List<String> r : beanRefs) { ps5.setString(1, r.get(0)); ps5.setString(2, r.get(1)); ps5.setString(3, r.get(2)); ps5.addBatch(); }
-                for (List<String> r : configKeys) { ps6.setString(1, r.get(0)); ps6.setString(2, r.get(1)); ps6.addBatch(); }
-                for (List<String> r : beanDecls) { ps7.setString(1, r.get(0)); ps7.setString(2, r.get(1)); ps7.setString(3, r.size() > 2 ? r.get(2) : ""); ps7.addBatch(); }
-                for (Map.Entry<String, Set<String>> e : propImpact.entrySet())
-                    for (String t : e.getValue()) { ps8.setString(1, e.getKey()); ps8.setString(2, t); ps8.addBatch(); }
-                for (List<String> r : configConsumers) { ps9.setString(1, r.get(0)); ps9.setString(2, r.get(1)); ps9.addBatch(); }
-                ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch();
-                ps4.executeBatch(); ps5.executeBatch(); ps6.executeBatch();
-                ps7.executeBatch(); ps8.executeBatch(); ps9.executeBatch();
+        int nClasses = 0;
+        try {
+            // ---- pass A: static/config rows, plus the global test/class vocabulary
+            for (Path db : dbs) {
+                Connection sc = DriverManager.getConnection("jdbc:sqlite:" + db);
+                src.add(sc);
+                mergeMap(sc, "SELECT from_c, to_c FROM class_refs", refs);
+                for (String[] r : readDb(sc, "SELECT from_c, key, kind FROM property_refs")) propRefs.add(Arrays.asList(r));
+                for (String[] r : readDb(sc, "SELECT from_c, ref, kind FROM bean_refs")) beanRefs.add(Arrays.asList(r));
+                for (String[] r : readDb(sc, "SELECT file, key FROM config_keys")) configKeys.add(Arrays.asList(r));
+                for (String[] r : readDb(sc, "SELECT file, bean_type, bean_id FROM bean_decls")) beanDecls.add(Arrays.asList(r));
+                for (String[] r : readDb(sc, "SELECT file, class FROM config_consumers")) configConsumers.add(Arrays.asList(r));
+                Map<Integer, String> ln = new HashMap<>();
+                localNames.add(ln);
+                if (!hasTable(sc, "cov_data")) continue;
+                for (String[] r : readDb(sc, "SELECT id, name FROM cov_test")) {
+                    ln.put(Integer.parseInt(r[0]), r[1]);
+                    allTests.add(r[1]);
+                }
+                for (String[] r : readDb(sc, "SELECT name FROM cov_class")) allClasses.add(r[0]);
             }
-            c.commit();
+
+            // global test ids, assigned in name order so per-class deltas stay >= 0
+            Map<String, Integer> gTestIds = new HashMap<>();
+            int nextId = 0;
+            for (String t : allTests) gTestIds.put(t, nextId++);
+
+            // property key -> every class whose change impacts that key. This is the
+            // reverse reference closure of the classes that read the key, which is
+            // exactly what the old precomputed `impact` table gave us.
+            Map<String, Set<String>> predsOf = new HashMap<>();
+            for (Map.Entry<String, Set<String>> e : refs.entrySet())
+                for (String to : e.getValue()) predsOf.computeIfAbsent(to, k -> new HashSet<>()).add(e.getKey());
+            Set<String> keys = new TreeSet<>();
+            for (List<String> pr : propRefs) keys.add(pr.get(1));
+            Map<String, Set<String>> closureKeys = new HashMap<>();
+            for (String k : keys) {
+                Deque<String> stack = new ArrayDeque<>();
+                for (List<String> pr : propRefs)
+                    if (pr.get(1).equals(k)) stack.push(topLevel(pr.get(0)));
+                Set<String> seen = new HashSet<>();
+                while (!stack.isEmpty()) {
+                    String n = stack.pop();
+                    if (!seen.add(n)) continue;
+                    closureKeys.computeIfAbsent(n, x -> new HashSet<>()).add(k);
+                    for (String m : predsOf.getOrDefault(n, Set.of()))
+                        if (!seen.contains(m)) stack.push(m);
+                }
+            }
+
+            try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out)) {
+                c.setAutoCommit(false);
+                String[] drops = {"class_refs", "test_covers", "impact", "cov_test", "cov_class", "cov_data",
+                        "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
+                        "config_consumers"};
+                for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
+                c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
+                c.createStatement().execute("CREATE TABLE cov_test(id INTEGER PRIMARY KEY, name TEXT)");
+                c.createStatement().execute("CREATE TABLE cov_class(id INTEGER PRIMARY KEY, name TEXT)");
+                c.createStatement().execute("CREATE TABLE cov_data(class_id INTEGER PRIMARY KEY, blob BLOB)");
+                c.createStatement().execute("CREATE TABLE property_refs(from_c TEXT, key TEXT, kind TEXT)");
+                c.createStatement().execute("CREATE TABLE bean_refs(from_c TEXT, ref TEXT, kind TEXT)");
+                c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
+                c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
+                c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
+                c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
+                try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
+                     PreparedStatement ps2 = c.prepareStatement("INSERT INTO cov_test VALUES (?,?)");
+                     PreparedStatement ps3 = c.prepareStatement("INSERT INTO cov_class VALUES (?,?)");
+                     PreparedStatement ps4 = c.prepareStatement("INSERT INTO cov_data VALUES (?,?)");
+                     PreparedStatement ps5 = c.prepareStatement("INSERT INTO property_refs VALUES (?,?,?)");
+                     PreparedStatement ps6 = c.prepareStatement("INSERT INTO bean_refs VALUES (?,?,?)");
+                     PreparedStatement ps7 = c.prepareStatement("INSERT INTO config_keys VALUES (?,?)");
+                     PreparedStatement ps8 = c.prepareStatement("INSERT INTO bean_decls VALUES (?,?,?)");
+                     PreparedStatement ps9 = c.prepareStatement("INSERT INTO property_impact VALUES (?,?)");
+                     PreparedStatement ps10 = c.prepareStatement("INSERT INTO config_consumers VALUES (?,?)")) {
+                    for (Map.Entry<String, Set<String>> e : refs.entrySet())
+                        for (String to : e.getValue()) { ps1.setString(1, e.getKey()); ps1.setString(2, to); ps1.setString(3, "reference"); ps1.addBatch(); }
+                    for (Map.Entry<String, Integer> e : gTestIds.entrySet()) { ps2.setInt(1, e.getValue()); ps2.setString(2, e.getKey()); ps2.addBatch(); }
+                    for (List<String> r : propRefs) { ps5.setString(1, r.get(0)); ps5.setString(2, r.get(1)); ps5.setString(3, r.get(2)); ps5.addBatch(); }
+                    for (List<String> r : beanRefs) { ps6.setString(1, r.get(0)); ps6.setString(2, r.get(1)); ps6.setString(3, r.get(2)); ps6.addBatch(); }
+                    for (List<String> r : configKeys) { ps7.setString(1, r.get(0)); ps7.setString(2, r.get(1)); ps7.addBatch(); }
+                    for (List<String> r : beanDecls) { ps8.setString(1, r.get(0)); ps8.setString(2, r.get(1)); ps8.setString(3, r.size() > 2 ? r.get(2) : ""); ps8.addBatch(); }
+                    for (List<String> r : configConsumers) { ps10.setString(1, r.get(0)); ps10.setString(2, r.get(1)); ps10.addBatch(); }
+
+                    // ---- pass B: merge coverage one class at a time, so peak memory
+                    //      stays bounded by the largest single class rather than by the
+                    //      whole index (decoding everything at once is ~6 GB of ints).
+                    int cid = 0;
+                    for (String cls : allClasses) {
+                        Map<String, Set<Integer>> merged = new HashMap<>();
+                        for (int i = 0; i < src.size(); i++) {
+                            if (localNames.get(i).isEmpty()) continue;
+                            byte[] raw = null;
+                            try (PreparedStatement ps = src.get(i).prepareStatement(
+                                    "SELECT d.blob FROM cov_data d JOIN cov_class k ON k.id = d.class_id WHERE k.name = ?")) {
+                                ps.setString(1, cls);
+                                try (ResultSet rs = ps.executeQuery()) {
+                                    if (rs.next()) raw = rs.getBytes(1);
+                                }
+                            }
+                            if (raw != null) decodeRaw(raw, localNames.get(i), merged);
+                        }
+                        if (merged.isEmpty()) continue;
+                        ps3.setInt(1, cid);
+                        ps3.setString(2, cls);
+                        ps3.addBatch();
+                        ps4.setInt(1, cid);
+                        ps4.setBytes(2, encodeCoverage(merged, gTestIds));
+                        ps4.addBatch();
+                        cid++;
+                        Set<String> ks = closureKeys.get(cls);
+                        if (ks != null)
+                            for (String k : ks) propImpact.computeIfAbsent(k, x -> new HashSet<>()).addAll(merged.keySet());
+                    }
+                    nClasses = cid;
+                    for (Map.Entry<String, Set<String>> e : propImpact.entrySet())
+                        for (String t : e.getValue()) { ps9.setString(1, e.getKey()); ps9.setString(2, t); ps9.addBatch(); }
+
+                    ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch(); ps4.executeBatch();
+                    ps5.executeBatch(); ps6.executeBatch(); ps7.executeBatch();
+                    ps8.executeBatch(); ps9.executeBatch(); ps10.executeBatch();
+                }
+                c.commit();
+            }
+        } finally {
+            for (Connection sc : src) {
+                try { sc.close(); } catch (Exception ignored) { }
+            }
         }
         System.out.println("aggregate: " + dbs.size() + " module indexes -> " + out
-                + " (" + impact.size() + " impacted classes, " + propImpact.size() + " impacted properties)");
+                + " (" + nClasses + " classes with coverage, " + allTests.size() + " tests, "
+                + propImpact.size() + " impacted properties)");
     }
 
     private static void mergeMap(Connection c, String sql, Map<String, Set<String>> dst) throws Exception {
@@ -1419,29 +1857,31 @@ public class TestGraph {
 
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
-            long covers = count(c, "SELECT COUNT(*) FROM test_covers");
-            if (covers == 0) fail("test_covers is empty");
+            Index idx = new Index(c);
+            long nTests = count(c, "SELECT COUNT(*) FROM cov_test");
+            long nClasses = count(c, "SELECT COUNT(*) FROM cov_class");
+            long nBlobs = count(c, "SELECT COUNT(*) FROM cov_data");
+            if (nTests == 0) fail("cov_test is empty");
+            if (nClasses == 0) fail("cov_class is empty");
+            if (nBlobs == 0) fail("cov_data is empty");
 
-            // round-trip: pick a covered class, ensure it maps back via impact
+            // round-trip: decode a stored blob, then confirm the test it names is
+            // reported as impacted by that same class. This exercises exactly the
+            // two calls refine() depends on.
             String cls = null, tst = null;
             try (PreparedStatement ps = c.prepareStatement(
-                    "SELECT class, test FROM test_covers LIMIT 1")) {
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) { cls = rs.getString(1); tst = rs.getString(2); }
-                }
+                    "SELECT name FROM cov_class ORDER BY id LIMIT 1");
+                 ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) cls = rs.getString(1);
             }
-            long back = 0;
             if (cls != null) {
-                try (PreparedStatement ps = c.prepareStatement(
-                        "SELECT COUNT(*) FROM impact WHERE class = ? AND test = ?")) {
-                    ps.setString(1, cls);
-                    ps.setString(2, tst);
-                    try (ResultSet rs = ps.executeQuery()) { if (rs.next()) back = rs.getLong(1); }
-                }
+                Map<String, Set<Integer>> lines = idx.lines(cls);
+                if (!lines.isEmpty()) tst = lines.keySet().iterator().next();
             }
-            if (back == 0) fail("Round-trip failed for class=" + cls + " test=" + tst);
+            if (cls == null || tst == null) fail("no decodable coverage in cov_data");
+            if (!idx.impacted(cls, false).contains(tst))
+                fail("Round-trip failed for class=" + cls + " test=" + tst);
 
-            long impacts = count(c, "SELECT COUNT(*) FROM impact");
             long edges = count(c, "SELECT COUNT(*) FROM class_refs");
             long propRefs = count(c, "SELECT COUNT(*) FROM property_refs");
             long beanRefs = count(c, "SELECT COUNT(*) FROM bean_refs");
@@ -1453,8 +1893,9 @@ public class TestGraph {
             if (configKeys == 0) fail("config_keys is empty");
             if (beanDecls == 0) fail("bean_decls is empty");
 
-            System.out.println("validate OK: " + execCount + " exec files, " + covers
-                    + " test_covers rows, " + edges + " edges, " + impacts + " impact rows");
+            System.out.println("validate OK: " + execCount + " exec files, " + nTests
+                    + " tests, " + nClasses + " classes with coverage, " + nBlobs
+                    + " blobs, " + edges + " edges");
             System.out.println("  config: " + propRefs + " property refs, " + beanRefs
                     + " bean refs, " + configKeys + " config keys, " + beanDecls
                     + " bean decls, " + propImpacts + " property_impact rows");
@@ -1567,7 +2008,7 @@ public class TestGraph {
         System.out.println("  build       --module <dir> [--per-test dir] [--edges file] [--config dir] [--db file]");
         System.out.println("  impacted    --db <file> (--file <src|fqcn> | --property <key> |");
         System.out.println("                          --configfile <path> | --bean <type|id> | --beanfile <path>)");
-        System.out.println("  refine      --db <file> --per-test <dir> --classes <dir> (--diff <file|-> | --base <ref> [--head <ref>])");
+        System.out.println("  refine      --db <file> (--diff <file|-> | --base <ref> [--head <ref>]) [--classes <dir>]");
         System.out.println("  validate    --module <dir> [--per-test dir] [--db file]");
         System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...]");
     }

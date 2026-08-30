@@ -87,5 +87,6 @@ fi
 
 # 3) Build the partial index from only this shard's per-test .exec files.
 DB="${DB_OUT:-$REPO/$MODULE/target/test-graph/impact-index.sqlite}"
-"$TG" build --module "$MODULE" --per-test "$PER_TEST" --db "$DB"
+"$TG" build --module "$MODULE" --per-test "$PER_TEST" \
+    --classes "$REPO/$MODULE/target/classes:$REPO/$MODULE/target/test-classes" --db "$DB"
 echo "phase-module: wrote $DB"
