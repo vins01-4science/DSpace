@@ -28,6 +28,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      baseline_branch:
+        description: "Branch to resolve the latest impact-index baseline from (default: main)"
+        required: false
+        default: main
 
 permissions:
   contents: read   # checkout + publish artifact
@@ -140,11 +145,13 @@ jobs:
       - name: Download previous baseline (latest full or patch)
         id: baseline
         run: |
+          # Missing on `push` events (no inputs there) => falls back to main.
+          BRANCH="${{ inputs.baseline_branch || 'main' }}"
           latest() {
             # No `|| true`: a GH auth/network failure must fail this step loudly,
             # not be masked as "no baseline exists yet". An empty result set from
             # a working authenticated call still yields an empty string (exit 0).
-            gh run list --repo "$GITHUB_REPOSITORY" --branch main --status success \
+            gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
               --workflow "$1" --limit 1 --json databaseId --jq '.[0].databaseId'
           }
           ID_FULL=$(latest "impact-index.yml")
