@@ -3,8 +3,20 @@
 # https://docs.github.com/en/free-pro-team@latest/actions/guides/building-and-testing-java-with-maven
 name: Build
 
-# Run this Build for all pushes / PRs to current branch
-on: [push, pull_request]
+# Run this Build on a weekly schedule + manual dispatch only.
+#
+# The full-suite build does NOT run on every push / PR anymore. The incremental
+# gates already cover the hot path with the impact-index:
+#   - test-affected.yml  (on: pull_request) -> runs only impacted tests
+#   - merge-patch.yml    (on: push)         -> runs only impacted tests + patches the index
+# The full build runs once per week (just after the weekly impact-index full
+# rebuild, Monday 03:00 UTC) to catch anything the incremental gates miss, and
+# uploads the aggregate coverage to Codecov. Use workflow_dispatch for manual runs.
+on:
+  schedule:
+    # Monday 04:00 UTC — after the weekly impact-index rebuild (03:00 UTC).
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read  #  to fetch code (actions/checkout)
