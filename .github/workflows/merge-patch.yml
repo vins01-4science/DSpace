@@ -72,6 +72,7 @@ jobs:
           M2="$HOME/.m2/repository"
           for artifact in \
             "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.jacoco:jacoco-maven-plugin:0.8.14" \
             "org.ow2.asm:asm:9.7.1" \
             "org.xerial:sqlite-jdbc:3.21.0.1" \
             "org.apache.maven.extensions:maven-build-cache-extension:1.2.3"; do

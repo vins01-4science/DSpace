@@ -232,13 +232,16 @@ jobs:
           echo "MAVEN_OPTS=-Xmx2048M -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
 
       # Resolve the jars the single-file TestGraph.java tool needs at runtime.
-      # Guarded: `assemble` warms jacoco/asm into the cache, so this only fires
-      # mvn when a jar is genuinely missing (cold cache).
+      # Guarded: `assemble` warms most jars into the cache, so this only fires
+      # mvn when a jar is genuinely missing (cold cache). jacoco-maven-plugin is
+      # NOT warmed by assemble (its goal only activates on test/verify with the
+      # test-class-graph profile) but is required for the offline `mvn -o` run.
       - name: Fetch test-graph tool dependencies (if not cached)
         run: |
           M2="$HOME/.m2/repository"
           for artifact in \
             "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.jacoco:jacoco-maven-plugin:0.8.14" \
             "org.ow2.asm:asm:9.7.1" \
             "org.xerial:sqlite-jdbc:3.21.0.1" \
             "org.apache.maven.extensions:maven-build-cache-extension:1.2.3"; do
