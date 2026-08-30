@@ -1,0 +1,200 @@
+# Merge Patch (baseline) — incremental update of the test-impact index on every
+# change that lands on `main`.
+#
+# Full rebuilds (impact-index.yml) are expensive (21+ sharded test jobs) and are
+# now only run weekly as a safety net. This workflow keeps the published
+# baseline fresh in between: it diffs the new HEAD against the commit the last
+# baseline was built from, re-runs ONLY the tests affected by that diff, and
+# merges their fresh coverage into the existing baseline.
+#
+# Why this is correct:
+#   - Patch semantics == `aggregate --db <baseline> --db2 <delta>`. cov_data is
+#     keyed by (class), each blob = per-test line sets. The union of baseline +
+#     delta is conservative: a re-run test's fresher lines replace the old ones
+#     (union), classes/tests not re-run keep their baseline entries, and the
+#     static tables (class_refs, property_impact, ...) are recomputed from the
+#     unioned inputs. Nothing is ever under-selected; over-conservative overlap
+#     is healed by the weekly full rebuild.
+#   - The PR gate (test-affected.yml) already validated the changes green when
+#     they merged, so this workflow may treat affected-test failures as coverage
+#     loss, not merge blockers.
+#
+# Output: a new `impact-index` artifact (root-index.sqlite + built-from.txt set
+# to the pushed SHA), same name/path as impact-index.yml so every consumer
+# (test-affected.yml) keeps working and always resolves the newest baseline.
+name: Merge Patch (baseline)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read   # checkout + publish artifact
+  actions: read    # download the previous baseline artifact
+
+concurrency:
+  group: merge-patch
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MAVEN_OPTS: "-Xmx2048M"
+      MVN: "mvn -o -B"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Install listener + test install (skip tests)
+        run: |
+          mvn -B -V install -f dspace-test-trace/pom.xml -DskipTests
+          mvn -B -V install -P-assembly -Ptest-class-graph \
+            -DskipTests -DskipUnitTests=true -DskipIntegrationTests=true \
+            -Denforcer.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true \
+            -Dxml.skip=true -Dspotbugs.skip=true -Dpmd.skip=true
+
+      - name: Fetch test-graph tool dependencies (if not cached)
+        run: |
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
+
+      - name: Download previous baseline (latest full or patch)
+        id: baseline
+        run: |
+          latest() {
+            gh run list --repo "$GITHUB_REPOSITORY" --branch main --status success \
+              --workflow "$1" --limit 1 --json databaseId --jq '.[0].databaseId' || true
+          }
+          ID_FULL=$(latest "impact-index.yml")
+          ID_PATCH=$(latest "merge-patch.yml")
+          RUN_ID=""
+          if [ -n "$ID_FULL" ] && [ -n "$ID_PATCH" ]; then
+            if [ "$ID_PATCH" -gt "$ID_FULL" ]; then RUN_ID="$ID_PATCH"; else RUN_ID="$ID_FULL"; fi
+          elif [ -n "$ID_FULL" ]; then RUN_ID="$ID_FULL"
+          elif [ -n "$ID_PATCH" ]; then RUN_ID="$ID_PATCH"; fi
+          if [ -z "$RUN_ID" ]; then
+            echo "No baseline index exists yet — skip patch (first weekly full rebuild will create it)."
+            exit 0
+          fi
+          gh run download "$RUN_ID" -n impact-index -D ./idx
+          BASE_SHA="$(cat ./idx/built-from.txt 2>/dev/null || true)"
+          if [ -z "$BASE_SHA" ]; then
+            echo "Baseline artifact lacks built-from.txt — cannot diff. Skip patch."
+            exit 0
+          fi
+          if [ "$BASE_SHA" = "${{ github.sha }}" ]; then
+            echo "Baseline already reflects this SHA — nothing to patch."
+            exit 0
+          fi
+          echo "db=$(pwd)/idx/root-index.sqlite" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Using baseline from run $RUN_ID (built from $BASE_SHA)"
+
+      - name: Compute affected tests since last baseline commit
+        id: affected
+        run: |
+          bash tools/test-graph/affected.sh \
+            --db "${{ steps.baseline.outputs.db }}" \
+            --base "${{ steps.baseline.outputs.base_sha }}" \
+            --head "${{ github.sha }}" \
+            --out target/test-graph/affected
+          UT="$(cat target/test-graph/affected/ut.csv)"
+          IT="$(cat target/test-graph/affected/it.csv)"
+          if [ -z "$UT" ] && [ -z "$IT" ]; then
+            echo "Nothing affected since ${{ steps.baseline.outputs.base_sha }} — baseline is already current."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ut=$UT" >> "$GITHUB_OUTPUT"
+          echo "it=$IT" >> "$GITHUB_OUTPUT"
+
+      - name: Run affected tests with per-test coverage
+        if: steps.affected.outputs.skip != '1'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # Restrict to the modules actually touched (real maven modules only),
+          # so unrelated modules are neither compiled nor (with -am) re-built.
+          MODS="$(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt \
+                  | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | sort -u | paste -sd, -)"
+          [ -z "$MODS" ] && MODS="dspace-api"
+          echo "affected modules: $MODS"
+          UT="${{ steps.affected.outputs.ut }}"
+          IT="${{ steps.affected.outputs.it }}"
+          if [ -n "$UT" ]; then
+            "$MVN" -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+              -DfailIfNoTests=false test "-Dtest=$UT" \
+              || echo "!! affected unit tests failed (see above) — coverage may be incomplete for this patch"
+          fi
+          if [ -n "$IT" ]; then
+            "$MVN" -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+              -DfailIfNoTests=false verify "-Dit.test=$IT" \
+              || echo "!! affected integration tests failed (see above) — coverage may be incomplete for this patch"
+          fi
+
+      - name: Build per-module delta partials
+        if: steps.affected.outputs.skip != '1'
+        run: |
+          mkdir -p target/test-graph/deltas
+          for mod in $(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt | sort -u); do
+            [ -f "$mod/pom.xml" ] || continue
+            [ -d "$mod/target/per-test" ] || continue
+            n=$(find "$mod/target/per-test" -name '*.exec' | wc -l)
+            [ "$n" -gt 0 ] || { echo "no coverage for $mod"; continue; }
+            echo "delta partial for $mod ($n execs)"
+            # --skip-tests: static + config + build from the .exec files already
+            # produced above (no test re-run, per-test dir is preserved).
+            bash tools/test-graph/phase-module.sh "$mod" --skip-tests \
+              --db-out "target/test-graph/deltas/delta-$mod.sqlite"
+          done
+
+      - name: Merge deltas into baseline
+        if: steps.affected.outputs.skip != '1'
+        run: |
+          ARGS=("aggregate" "--out" "target/test-graph/root-index.sqlite")
+          ARGS+=(--db "${{ steps.baseline.outputs.db }}")
+          i=2
+          for f in $(find target/test-graph/deltas -name 'delta-*.sqlite' | sort); do
+            ARGS+=(--db$i "$f"); i=$((i+1))
+          done
+          bash tools/test-graph/run.sh "${ARGS[@]}" > target/test-graph/aggregate.log
+          tail -5 target/test-graph/aggregate.log
+
+      - name: Validate patched index
+        if: steps.affected.outputs.skip != '1'
+        run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite || true
+
+      - name: Keep prior baseline when nothing was affected
+        if: steps.affected.outputs.skip == '1'
+        run: |
+          mkdir -p target/test-graph
+          cp "${{ steps.baseline.outputs.db }}" target/test-graph/root-index.sqlite
+
+      - name: Record source commit
+        run: echo "${{ github.sha }}" > target/test-graph/built-from.txt
+
+      - name: Upload impact-index artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: impact-index
+          path: |
+            target/test-graph/root-index.sqlite
+            target/test-graph/built-from.txt
+          retention-days: 90

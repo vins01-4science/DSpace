@@ -44,19 +44,24 @@ jobs:
           cache: 'maven'
 
       # ---- 1. download the baseline index from the targeted base branch ----
+      # The baseline is published by both impact-index.yml (weekly full rebuild)
+      # and merge-patch.yml (incremental per-merge updates); PRs must resolve the
+      # newest of the two on the base branch, falling back to `main`.
       - name: Download baseline impact-index
         id: baseline
         run: |
           BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
-          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$BASE_BRANCH" \
-                    --workflow impact-index.yml --status success --limit 1 \
+          RUN_ID=""
+          for B in "$BASE_BRANCH" main; do
+            for W in impact-index.yml merge-patch.yml; do
+              ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$B" \
+                    --workflow "$W" --status success --limit 1 \
                     --json databaseId --jq '.[0].databaseId' || true)
-          if [ -z "$RUN_ID" ]; then
-            echo "No baseline index for $BASE_BRANCH, falling back to main"
-            RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch main \
-                      --workflow impact-index.yml --status success --limit 1 \
-                      --json databaseId --jq '.[0].databaseId' || true)
-          fi
+              if [ -n "$ID" ] && { [ -z "$RUN_ID" ] || [ "$ID" -gt "$RUN_ID" ]; }; then
+                RUN_ID="$ID"
+              fi
+            done
+          done
           if [ -n "$RUN_ID" ]; then
             gh run download "$RUN_ID" -n impact-index -D ./idx
             echo "db=./idx/root-index.sqlite" >> "$GITHUB_OUTPUT"

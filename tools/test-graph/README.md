@@ -3,10 +3,13 @@
 A self-contained toolchain that builds a **test-impact index** for the DSpace
 backend: a SQLite database mapping every source class, property, config file,
 and Spring bean declaration to the tests that must be re-run when it changes.
-A GitHub Actions pipeline (`.github/workflows/impact-index.yml`) publishes the
-index on every push to `main`; pull-request runs
-(`.github/workflows/test-affected.yml`) download it and run **only** the tests
-affected by the PR.
+A GitHub Actions pipeline publishes the index and consumes it in three
+cadence layers:
+
+* **Full rebuild** — `.github/workflows/impact-index.yml`, weekly + manual.
+* **Merge patch** — `.github/workflows/merge-patch.yml`, every push to `main`.
+* **PR gate** — `.github/workflows/test-affected.yml`, per PR: download the
+  latest index and run **only** the tests affected by the PR.
 
 Everything lives under `tools/test-graph/` as a single-file Java program
 (`TestGraph.java`) plus small shell drivers. No Maven module, no plugin — the
@@ -171,6 +174,10 @@ Two drivers support this:
 
 ### `.github/workflows/impact-index.yml`
 
+A **full rebuild** of the baseline, run on a schedule (weekly, Monday 03:00 UTC)
+or manually via `workflow_dispatch`. The PR gate (`test-affected.yml`) and the
+merge patch (`merge-patch.yml`) both read its `impact-index` artifact.
+
 Four jobs:
 
 1. **`plan`** — emits the build matrix (one cell per `module × shard`) from a
@@ -180,20 +187,68 @@ Four jobs:
 3. **`build`** — the matrix; each cell runs `phase-module.sh` and uploads a
    `idx-<module>-<shard>` artifact. `fail-fast: false`; a shard's test failure
    does not fail the job (the partial index is still produced — the PR gate runs
-   the real affected tests and would surface failures).
+   the real affected tests and would surface failures). Runs with `mvn -o -B`
+   (offline) since `assemble` warmed the cache, and fetches the tool jars only
+   when missing.
 4. **`merge`** — downloads all `idx-*` artifacts, runs `aggregate` into
    `root-index.sqlite`, validates, and publishes the `impact-index` artifact
    (90-day retention, with `built-from.txt` recording the source commit).
 
+### Cadence (three layers)
+
+1. **PR gate** (`test-affected.yml`, per PR) — runs only the tests affected by
+   the PR diff, from the latest published baseline.
+2. **Merge patch** (`merge-patch.yml`, every push to `main`) — a cheap
+   incremental update that re-runs only the tests affected by the pushed
+   commits and merges their fresh coverage into the existing baseline. See below.
+3. **Full rebuild** (`impact-index.yml`, weekly + manual) — the safety net. It
+   re-runs everything so line-tables and coverage that the patches could not
+   track (drift induced by refactors, new/changed tests over time, build
+   non-determinism) are re-observed end to end.
+
+### `.github/workflows/merge-patch.yml` (incremental baseline)
+
+The full rebuild is expensive (~2 runner-hours). To keep the baseline current
+between weekly rebuilds, every merge to `main` patches it instead of rebuilding:
+
+1. Download the latest successful `impact-index` artifact (from the weekly full
+   rebuild *or* a previous merge patch) and read the `built-from.txt` commit it
+   was computed from.
+2. Run `affected.sh --db baseline --base <built-from> --head <HEAD>` to select
+   the tests affected by the pushed commits.
+3. Run **only** those tests (UT via `-Dtest=`, IT via `-Dit.test=`, per-module)
+   under the `test-class-graph` profile, so fresh per-test `.exec` files land in
+   each module's `target/per-test`.
+4. For each module, build a **delta partial** from its freshly-run execs:
+   `phase-module.sh <module> --skip-tests --db-out deltas/delta-<module>.sqlite`
+   (`--skip-tests` skips the test-run phase and just runs the index build over
+   the existing `target/per-test` dir).
+5. `aggregate --db <baseline> --db2 <delta>...` unions the deltas into the
+   baseline — conservative, never drops coverage — and publishes the patched
+   `root-index.sqlite` as a new `impact-index` artifact with an updated
+   `built-from.txt`.
+
+If `built-from.txt` is missing/equal to the pushed SHA, or no tests are
+affected, the workflow exits early keeping the prior baseline. A failing
+affected test does not abort the patch: the job logs a `!!` warning and still
+merges whatever coverage was captured (the failing test is reported out of
+band for `main`).
+
+`phase-module.sh` also accepts `--tests U I` to run an explicit comma-separated
+list of unit (U) / integration (I) test classes (used by manual incremental
+runs) — it bypasses `split-tests` sharding.
+
 ### Tuning shard counts
 
 Edit the `SHARDS` array in the `plan` job. Higher numbers spread a module's
-tests across more workers (lower per-job time, more jobs). Current defaults:
+tests across more workers (lower per-job time, more jobs). Current defaults
+(webapp runs `--it` and boots many Spring contexts, so it is ~3x slower per
+test and gets more workers):
 
 | Module | Shards |
 | --- | --- |
-| dspace-api | 8 |
-| dspace-server-webapp | 4 |
+| dspace-api | 6 |
+| dspace-server-webapp | 8 |
 | dspace-oai | 2 |
 | dspace-services | 1 |
 | dspace-rdf | 1 |

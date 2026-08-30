@@ -3,9 +3,14 @@
 #
 # The index maps every source class / property / config file / bean declaration
 # to the tests that must be re-run when it changes. Pull-request runs
-# (test-affected.yml) download THIS artifact instead of rebuilding it.
+# (test-affected.yml) and the incremental merge-patch (merge-patch.yml)
+# download THIS artifact instead of rebuilding it.
 #
-# Trigger: every push to `main` (and manual dispatch).
+# Cadence: this is the FULL rebuild — a weekly safety net that catches coverage
+# drift, line-shift degradation, new classes and behavior the per-merge patches
+# could not track. Every push to `main` is handled cheaply by merge-patch.yml
+# (incremental), which re-runs only the affected tests and merges the result
+# into the previous baseline. Trigger: weekly cron + manual dispatch.
 #
 # Parallelization strategy: tests are sharded across a CI matrix. Each matrix
 # cell runs ONE module + ONE shard (a subset of that module's test classes) and
@@ -16,8 +21,9 @@
 name: Impact Index (baseline)
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    # Weekly full rebuild (Monday 03:00 UTC) — the safety net.
+    - cron: '0 3 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -36,9 +42,13 @@ jobs:
       - id: set
         run: |
           # module:shardCount
+          # Tuned to test volume per module: dspace-api and dspace-server-webapp
+          # have comparable test-minute totals (~52 vs ~58), so webapp gets more
+          # workers (its `--it` REST ITs boot many Spring contexts). Keep the
+          # per-cell duration within the free-tier wall-clock budget.
           SHARDS=(
-            "dspace-api:8"
-            "dspace-server-webapp:4"
+            "dspace-api:6"
+            "dspace-server-webapp:8"
             "dspace-oai:2"
             "dspace-services:1"
             "dspace-rdf:1"
@@ -102,6 +112,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     env:
       MAVEN_OPTS: "-Xmx2048M"
+      # Every module builds offline: `assemble` already installed the full
+      # reactor with -Ptest-class-graph, so its test-side jars (surefire,
+      # failsafe, jacoco agent, junit-platform) are all in the Maven cache.
+      MVN: "mvn -o -B"
     steps:
       - uses: actions/checkout@v7
 
@@ -112,11 +126,21 @@ jobs:
           cache: 'maven'
 
       # Resolve the jars the single-file TestGraph.java tool needs at runtime.
-      - name: Fetch test-graph tool dependencies
+      # Guarded: `assemble` warms jacoco/asm into the cache, so this only fires
+      # mvn when a jar is genuinely missing (cold cache).
+      - name: Fetch test-graph tool dependencies (if not cached)
         run: |
-          mvn -B -V dependency:get -Dartifact=org.jacoco:org.jacoco.core:0.8.14
-          mvn -B -V dependency:get -Dartifact=org.ow2.asm:asm:9.7.1
-          mvn -B -V dependency:get -Dartifact=org.xerial:sqlite-jdbc:3.21.0.1
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
 
       # dspace-test-trace + all upstream modules are already in the Maven cache
       # (populated by the `assemble` job), so only this module is built/tested.
@@ -149,11 +173,19 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Fetch test-graph tool dependencies
+      - name: Fetch test-graph tool dependencies (if not cached)
         run: |
-          mvn -B -V dependency:get -Dartifact=org.jacoco:org.jacoco.core:0.8.14
-          mvn -B -V dependency:get -Dartifact=org.ow2.asm:asm:9.7.1
-          mvn -B -V dependency:get -Dartifact=org.xerial:sqlite-jdbc:3.21.0.1
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
 
       - name: Download partial indexes
         uses: actions/download-artifact@v7

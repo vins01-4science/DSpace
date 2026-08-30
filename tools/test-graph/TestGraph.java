@@ -1320,6 +1320,7 @@ public class TestGraph {
         Set<String> candidates = new TreeSet<>();
         Set<String> inScope = new TreeSet<>();
         Map<String, Set<String>> touchedMethods = new HashMap<>();
+        boolean fellBack = false;
         Set<String> configClasses = new TreeSet<>();
         configClasses.addAll(methodLinesMap.keySet());
         configClasses.addAll(classOnly);
@@ -1380,14 +1381,29 @@ public class TestGraph {
                 }
                 if (hit) inScope.add(test);
             }
+
+            // NEVER under-select: if line-level narrowing dropped every candidate, fall
+            // back to the class-level candidate union (same guarantee as the no-coverage
+            // degraded path). A stale/missing coverage blob for a changed class can
+            // therefore never turn into "0 tests to re-run".
+            if (haveCoverage && inScope.isEmpty() && !candidates.isEmpty()) {
+                inScope.addAll(candidates);
+                fellBack = true;
+            }
         }
 
         if (opts.containsKey("csv")) {
             inScope.forEach(System.out::println);
             return;
         }
-        System.out.println("refine: " + candidates.size() + " tests at class-level impact, "
-                + inScope.size() + " tests actually cover changed lines/methods");
+        if (fellBack) {
+            System.out.println("refine: no candidate covered the changed lines (index may be stale for "
+                    + candidateClasses + "), fell back to the " + candidates.size()
+                    + " class-level impacted tests");
+        } else {
+            System.out.println("refine: " + candidates.size() + " tests at class-level impact, "
+                    + inScope.size() + " tests actually cover changed lines/methods");
+        }
         System.out.println("Changed classes: " + candidateClasses);
         System.out.println("Tests to re-run (" + inScope.size() + "):");
         if (inScope.isEmpty()) System.out.println("  (none)");
