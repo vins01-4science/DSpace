@@ -8,8 +8,10 @@
 #   3. Run only those tests:
 #        - unit tests always (root reactor, -Dtest=<csv>)
 #        - integration tests only when an affected test is an IT (-Dit.test=<csv>)
-#      If nothing is affected (docs-only / new file), fall back to running the
-#      full suite of the touched modules.
+#      If NO baseline is found (cold base branch), the honest gate is the FULL
+#      suite — without an index we cannot know what is affected. If a baseline
+#      exists but nothing is affected (docs-only / new file), fall back to
+#      running the full suite of the touched modules.
 #
 # This job does NOT rebuild the index and does NOT attach the JaCoCo agent;
 # it just re-runs the already-selected tests.
@@ -93,6 +95,11 @@ jobs:
           {
             echo "ut_csv<<EOF"; echo "$UT_CSV"; echo "EOF"
             echo "it_csv<<EOF"; echo "$IT_CSV"; echo "EOF"
+            if [ -n "$DB" ]; then
+              echo "baseline_found=true"
+            else
+              echo "baseline_found=false"
+            fi
           } >> "$GITHUB_OUTPUT"
 
       # ---- 3. run only the affected tests (with module-suite fallback) ----
@@ -100,10 +107,17 @@ jobs:
         run: |
           UT_CSV="${{ steps.affected.outputs.ut_csv }}"
           IT_CSV="${{ steps.affected.outputs.it_csv }}"
+          BASELINE_FOUND="${{ steps.affected.outputs.baseline_found }}"
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          if [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then
+          if [ "$BASELINE_FOUND" = "false" ]; then
+            # No baseline impact-index yet — we cannot compute what is affected,
+            # so the honest gate is the FULL suite (the pre-impact-testing build).
+            echo "No baseline impact-index found -> running the FULL suite (whole reactor, UT + IT)."
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
+              -DfailIfNoTests=false
+          elif [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then
             echo "Running UT $UT_CSV + IT $IT_CSV"
             mvn -B -V install -P-assembly -DskipUnitTests=false -DfailIfNoTests=false \
               -Dtest="$UT_CSV" -DskipIntegrationTests=false -Dit.test="$IT_CSV"
@@ -116,7 +130,13 @@ jobs:
             mvn -B -V install -P-assembly -DskipIntegrationTests=false -DfailIfNoTests=false \
               -Dit.test="$IT_CSV" -DskipUnitTests=true
           else
-            # Fallback: run the full test suite of the touched modules.
+            # Baseline exists but nothing is affected by the diff:
+            #   - docs-only / new files              -> nothing to test
+            #   - source changes missed by the index -> touched modules' suites.
+            # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
+            # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
+            # determined" failure seen in merge-patch). Install the reactor first
+            # (this also materializes the complete zip in local m2), THEN test -pl.
             MODULES=$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA" \
                         | cut -d/ -f1 | grep '^dspace' | sort -u | paste -sd, -)
             if [ -z "$MODULES" ]; then
@@ -124,7 +144,9 @@ jobs:
               exit 0
             fi
             echo "Falling back to full suites of modules: $MODULES"
-            mvn -B -V install -P-assembly -pl "$MODULES" -am \
+            mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
+              -DfailIfNoTests=false
+            mvn -B -V install -P-assembly -pl "$MODULES" \
               -DskipUnitTests=false -DskipIntegrationTests=true -DfailIfNoTests=false
           fi
 
