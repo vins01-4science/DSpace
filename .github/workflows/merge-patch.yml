@@ -55,6 +55,62 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      # Persist the Maven build-cache directory across runs (the extension's own
+      # content-addressed store). Keyed on the branch so consecutive pushes to
+      # `main` share one cache.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/build-cache
+          key: maven-build-cache-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: maven-build-cache-${{ runner.os }}-
+
+      # Maven build-cache extension + the jars the single-file TestGraph.java
+      # tool needs at runtime. Guarded: only fires mvn when a jar is genuinely
+      # missing (cold cache).
+      - name: Fetch test-graph deps + build-cache extension (if not cached)
+        run: |
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1" \
+            "org.apache.maven.extensions:maven-build-cache-extension:1.2.3"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
+
+      # Enable the Maven build-cache extension for this job. It restores
+      # per-goal OUTPUTS (compiled classes, jars) keyed on real inputs (sources,
+      # poms, plugin config) — not wall-clock mtimes — so a warm cache lets Maven
+      # skip recompiling the whole reactor on the next push.
+      #
+      # CRITICAL: maven-surefire-plugin / maven-failsafe-plugin are in
+      # executionControl/runAlways, so test EXECUTION is never skipped from
+      # cache. The per-test JaCoCo .exec files (and thus cov_data) are only as
+      # good as the tests that actually ran; test goals must always execute.
+      - name: Enable Maven build cache (compile-restore only; tests always run)
+        run: |
+          mkdir -p "$RUNNER_TEMP/build-cache-config"
+          cat > "$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml" <<'EOF'
+          <cache xmlns="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0 https://maven.apache.org/xsd/build-cache-config-1.2.0.xsd">
+              <configuration>
+                  <enabled>true</enabled>
+              </configuration>
+              <executionControl>
+                  <runAlways>
+                      <plugins>
+                          <plugin artifactId="maven-surefire-plugin"/>
+                          <plugin artifactId="maven-failsafe-plugin"/>
+                      </plugins>
+                  </runAlways>
+              </executionControl>
+          </cache>
+          EOF
+          echo "MAVEN_OPTS=-Xmx2048M -Dmaven.ext.class.path=$HOME/.m2/repository/org/apache/maven/extensions/maven-build-cache-extension/1.2.3/maven-build-cache-extension-1.2.3.jar -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
+
       - name: Install listener + test install (skip tests)
         run: |
           mvn -B -V install -f dspace-test-trace/pom.xml -DskipTests
@@ -62,20 +118,6 @@ jobs:
             -DskipTests -DskipUnitTests=true -DskipIntegrationTests=true \
             -Denforcer.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true \
             -Dxml.skip=true -Dspotbugs.skip=true -Dpmd.skip=true
-
-      - name: Fetch test-graph tool dependencies (if not cached)
-        run: |
-          M2="$HOME/.m2/repository"
-          for artifact in \
-            "org.jacoco:org.jacoco.core:0.8.14" \
-            "org.ow2.asm:asm:9.7.1" \
-            "org.xerial:sqlite-jdbc:3.21.0.1"; do
-            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
-            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
-              echo "fetching $artifact"
-              mvn -B -V dependency:get -Dartifact="$artifact"
-            fi
-          done
 
       - name: Download previous baseline (latest full or patch)
         id: baseline

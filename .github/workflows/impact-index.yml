@@ -85,6 +85,55 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      # Persist the Maven build-cache directory (the extension's content-
+      # addressed store). Shared across all build jobs via restore-keys.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/build-cache
+          key: maven-build-cache-${{ runner.os }}-assemble
+          restore-keys: maven-build-cache-${{ runner.os }}-
+
+      # Maven build-cache extension + the jars the single-file TestGraph.java
+      # tool needs at runtime. Guarded: only fires mvn when a jar is genuinely
+      # missing. Fetched in assemble so the build jobs hit the `cache: maven`.
+      - name: Fetch test-graph deps + build-cache extension (if not cached)
+        run: |
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1" \
+            "org.apache.maven.extensions:maven-build-cache-extension:1.2.3"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
+
+      # Enable the Maven build-cache extension (see merge-patch.yml): restores
+      # per-goal outputs keyed on real inputs; surefire/failsafe are in
+      # executionControl/runAlways so tests ALWAYS execute (fresh .exec).
+      - name: Enable Maven build cache (compile-restore only; tests always run)
+        run: |
+          mkdir -p "$RUNNER_TEMP/build-cache-config"
+          cat > "$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml" <<'EOF'
+          <cache xmlns="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0 https://maven.apache.org/xsd/build-cache-config-1.2.0.xsd">
+              <configuration>
+                  <enabled>true</enabled>
+              </configuration>
+              <executionControl>
+                  <runAlways>
+                      <plugins>
+                          <plugin artifactId="maven-surefire-plugin"/>
+                          <plugin artifactId="maven-failsafe-plugin"/>
+                      </plugins>
+                  </runAlways>
+              </executionControl>
+          </cache>
+          EOF
+          echo "MAVEN_OPTS=-Xmx2048M -Dmaven.ext.class.path=$HOME/.m2/repository/org/apache/maven/extensions/maven-build-cache-extension/1.2.3/maven-build-cache-extension-1.2.3.jar -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
+
       # dspace-test-trace is NOT part of the reactor (added as a test dependency
       # by the test-class-graph profile), so install it explicitly.
       - name: Install dspace-test-trace listener
@@ -125,6 +174,39 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      # Persist the Maven build-cache directory per module (shared across shards
+      # of the same module via restore-keys).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/build-cache
+          key: maven-build-cache-${{ runner.os }}-${{ matrix.module }}
+          restore-keys: |
+            maven-build-cache-${{ runner.os }}-${{ matrix.module }}
+            maven-build-cache-${{ runner.os }}-
+
+      # Enable the Maven build-cache extension (see merge-patch.yml): restores
+      # per-goal outputs keyed on real inputs; surefire/failsafe are in
+      # executionControl/runAlways so tests ALWAYS execute (fresh .exec).
+      - name: Enable Maven build cache (compile-restore only; tests always run)
+        run: |
+          mkdir -p "$RUNNER_TEMP/build-cache-config"
+          cat > "$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml" <<'EOF'
+          <cache xmlns="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0 https://maven.apache.org/xsd/build-cache-config-1.2.0.xsd">
+              <configuration>
+                  <enabled>true</enabled>
+              </configuration>
+              <executionControl>
+                  <runAlways>
+                      <plugins>
+                          <plugin artifactId="maven-surefire-plugin"/>
+                          <plugin artifactId="maven-failsafe-plugin"/>
+                      </plugins>
+                  </runAlways>
+              </executionControl>
+          </cache>
+          EOF
+          echo "MAVEN_OPTS=-Xmx2048M -Dmaven.ext.class.path=$HOME/.m2/repository/org/apache/maven/extensions/maven-build-cache-extension/1.2.3/maven-build-cache-extension-1.2.3.jar -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
+
       # Resolve the jars the single-file TestGraph.java tool needs at runtime.
       # Guarded: `assemble` warms jacoco/asm into the cache, so this only fires
       # mvn when a jar is genuinely missing (cold cache).
@@ -134,7 +216,8 @@ jobs:
           for artifact in \
             "org.jacoco:org.jacoco.core:0.8.14" \
             "org.ow2.asm:asm:9.7.1" \
-            "org.xerial:sqlite-jdbc:3.21.0.1"; do
+            "org.xerial:sqlite-jdbc:3.21.0.1" \
+            "org.apache.maven.extensions:maven-build-cache-extension:1.2.3"; do
             g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
             if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
               echo "fetching $artifact"
