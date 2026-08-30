@@ -31,4 +31,10 @@ public abstract class ExternalServiceFactory {
         return DSpaceServicesFactory.getInstance().getServiceManager()
                                     .getServiceByName("externalServiceFactory", ExternalServiceFactory.class);
     }
+
+    /**
+     * Phase-0 validation marker: intentionally unused, tests nothing, exists only
+     * to exercise the merge-patch workflow end to end on the feature branch.
+     */
+    public static final String PHASE0_VALIDATION_MARKER = "throwaway";
 }
