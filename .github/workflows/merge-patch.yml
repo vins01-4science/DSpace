@@ -26,13 +26,12 @@ name: Merge Patch (baseline)
 
 on:
   push:
-    branches: [main]
+    branches: [main, task/test-class-graph-phase0]
   workflow_dispatch:
     inputs:
       baseline_branch:
-        description: "Branch to resolve the latest impact-index baseline from (default: main)"
+        description: "Branch to resolve the latest impact-index baseline from (default: the branch this run is on)"
         required: false
-        default: main
 
 permissions:
   contents: read   # checkout + publish artifact
@@ -145,8 +144,11 @@ jobs:
       - name: Download previous baseline (latest full or patch)
         id: baseline
         run: |
-          # Missing on `push` events (no inputs there) => falls back to main.
-          BRANCH="${{ inputs.baseline_branch || 'main' }}"
+          # Default = the branch this run is on (pushed ref or dispatched ref), so the
+          # baseline is looked up where that branch's own runs published one
+          # (feature branch validates pre-merge; main uses main's). An explicit
+          # workflow_dispatch input overrides it.
+          BRANCH="${{ inputs.baseline_branch || github.ref_name }}"
           latest() {
             # Newest successful run of $1 on $BRANCH that actually carries an
             # `impact-index` artifact. A green merge-patch run can legitimately
