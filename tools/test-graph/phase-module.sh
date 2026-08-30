@@ -103,6 +103,16 @@ elif [[ -n "$SHARD" && -n "$TOTAL" ]]; then
     "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
       verify "-Dit.test=$IT_LIST"
   fi
+  if [[ ! -s "$MODULE/$UT_REL" && ! -s "$MODULE/$IT_REL" ]]; then
+    # This module has no test classes (or none on this shard): nothing to
+    # run. Compile the classes so `static` can still extract the module's
+    # node + edges; the partial will be config/static-only (no coverage),
+    # which is correct. Without this a test-less module tripped the
+    # "no .exec files produced" guard below.
+    echo "phase-module: $MODULE has no tests - compiling classes for the static graph"
+    "${MVN_ARR[@]}" -pl "$MODULE" -DskipUnitTests=true -DskipIntegrationTests=true test-compile
+    NO_TESTS=1
+  fi
 else
   if [[ "$RUN_IT" -eq 1 ]]; then
     "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=false \
@@ -115,8 +125,8 @@ fi
 
 # 2) Fail fast if the test run produced no per-test .exec files (e.g. maven
 #    never executed the tests): an empty partial would silently dilute the
-#    aggregated baseline.
-if [[ "$SKIP_TESTS" -eq 0 ]]; then
+#    aggregated baseline. Skipped for test-less modules (NO_TESTS=1).
+if [[ "${NO_TESTS:-0}" -eq 0 && "$SKIP_TESTS" -eq 0 ]]; then
   n_exec="$(find "$PER_TEST" -maxdepth 1 -name '*.exec' 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "$n_exec" -eq 0 ]]; then
     echo "phase-module: ERROR: no per-test .exec files produced under $PER_TEST (mvn test/verify failed?)" >&2
