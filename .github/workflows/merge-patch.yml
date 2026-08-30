@@ -44,6 +44,7 @@ jobs:
     env:
       MAVEN_OPTS: "-Xmx2048M"
       MVN: "mvn -o -B"
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -140,8 +141,11 @@ jobs:
         id: baseline
         run: |
           latest() {
+            # No `|| true`: a GH auth/network failure must fail this step loudly,
+            # not be masked as "no baseline exists yet". An empty result set from
+            # a working authenticated call still yields an empty string (exit 0).
             gh run list --repo "$GITHUB_REPOSITORY" --branch main --status success \
-              --workflow "$1" --limit 1 --json databaseId --jq '.[0].databaseId' || true
+              --workflow "$1" --limit 1 --json databaseId --jq '.[0].databaseId'
           }
           ID_FULL=$(latest "impact-index.yml")
           ID_PATCH=$(latest "merge-patch.yml")
