@@ -60,19 +60,18 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      # Persist the Maven build-cache directory across runs (the extension's own
-      # content-addressed store). Keyed on the branch so consecutive pushes to
-      # `main` share one cache.
-      - uses: actions/cache@v4
-        with:
-          path: ~/.m2/build-cache
-          key: maven-build-cache-${{ runner.os }}-${{ github.ref_name }}
-          restore-keys: maven-build-cache-${{ runner.os }}-
-
-      # Maven build-cache extension + the jars the single-file TestGraph.java
-      # tool needs at runtime. Guarded: only fires mvn when a jar is genuinely
-      # missing (cold cache).
-      - name: Fetch test-graph deps + build-cache extension (if not cached)
+      # The jars the single-file TestGraph.java tool needs at runtime. Guarded:
+      # only fires mvn when a jar is genuinely missing (cold ~/.m2).
+      #
+      # NOTE: the Maven build-cache extension is deliberately NOT used here. It
+      # never restored in practice (each run reinstalls fresh SNAPSHOT artifacts,
+      # so the input checksum — and the dependency set — changes every run and the
+      # whole reactor recompiles anyway, c.f. "Recompiling the module because of
+      # changed dependency" / "Compiling 1784 source files"), and its plugin-config
+      # restore corrupted the forked test JVM's environment (all affected tests
+      # errored with "DSpace home directory could not be determined" while the
+      # same command passes locally). Deterministic, slower-but-correct.
+      - name: Fetch test-graph runtime deps (if not cached)
         run: |
           M2="$HOME/.m2/repository"
           for artifact in \
@@ -83,55 +82,13 @@ jobs:
             "org.apache.maven.plugins:maven-surefire-plugin:3.5.3" \
             "org.apache.maven.plugins:maven-failsafe-plugin:3.5.3" \
             "org.apache.maven.surefire:surefire-junit-platform:3.5.3" \
-            "org.apache.maven.surefire:surefire-junit4:3.5.3" \
-            "org.apache.maven.extensions:maven-build-cache-extension:1.2.3"; do
+            "org.apache.maven.surefire:surefire-junit4:3.5.3"; do
             g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
             if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
               echo "fetching $artifact"
               mvn -B -V dependency:get -Dartifact="$artifact"
             fi
           done
-
-      # Enable the Maven build-cache extension for this job. It restores
-      # per-goal OUTPUTS (compiled classes, jars) keyed on real inputs (sources,
-      # poms, plugin config) — not wall-clock mtimes — so a warm cache lets Maven
-      # skip recompiling the whole reactor on the next push.
-      #
-      # CRITICAL: maven-surefire-plugin / maven-failsafe-plugin are in
-      # executionControl/runAlways, so test EXECUTION is never skipped from
-      # cache. The per-test JaCoCo .exec files (and thus cov_data) are only as
-      # good as the tests that actually ran; test goals must always execute.
-      - name: Enable Maven build cache (compile-restore only; tests always run)
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/.mvn" "$RUNNER_TEMP/build-cache-config"
-          # Load the extension as a CORE extension (repo-level .mvn/extensions.xml,
-          # CI-only — never committed). `-Dmaven.ext.class.path` is NOT supported:
-          # it loads in a child realm where Sisu cannot inject CacheControllerImpl.
-          cat > "$GITHUB_WORKSPACE/.mvn/extensions.xml" <<'EOF'
-          <extensions xmlns="http://maven.apache.org/EXTENSIONS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/EXTENSIONS/1.0.0 https://maven.apache.org/xsd/core-extensions-1.0.0.xsd">
-              <extension>
-                  <groupId>org.apache.maven.extensions</groupId>
-                  <artifactId>maven-build-cache-extension</artifactId>
-                  <version>1.2.3</version>
-              </extension>
-          </extensions>
-          EOF
-          cat > "$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml" <<'EOF'
-          <cache xmlns="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/BUILD-CACHE-CONFIG/1.2.0 https://maven.apache.org/xsd/build-cache-config-1.2.0.xsd">
-              <configuration>
-                  <enabled>true</enabled>
-              </configuration>
-              <executionControl>
-                  <runAlways>
-                      <plugins>
-                          <plugin artifactId="maven-surefire-plugin"/>
-                          <plugin artifactId="maven-failsafe-plugin"/>
-                      </plugins>
-                  </runAlways>
-              </executionControl>
-          </cache>
-          EOF
-          echo "MAVEN_OPTS=-Xmx2048M -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
 
       - name: Install listener + test install (skip tests)
         run: |
@@ -231,14 +188,18 @@ jobs:
           if [ -n "$UT" ]; then
             # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
             # and word-splitting must apply (a quoted "$MVN" would be one command).
+            #
+            # A non-zero exit here FAILS the run. Test failures or a broken test
+            # environment must surface loudly — a green run that silently lost all
+            # per-test coverage was the original false-green bug of this workflow.
             $MVN -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
               -DfailIfNoTests=false test "-Dtest=$UT" \
-              || echo "!! affected unit tests failed (see above) — coverage may be incomplete for this patch"
+              || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
           fi
           if [ -n "$IT" ]; then
             $MVN -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
               -DfailIfNoTests=false verify "-Dit.test=$IT" \
-              || echo "!! affected integration tests failed (see above) — coverage may be incomplete for this patch"
+              || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
           fi
 
       - name: Build per-module delta partials
