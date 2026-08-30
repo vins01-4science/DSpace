@@ -151,15 +151,24 @@ jobs:
             # Newest successful run of $1 on $BRANCH that actually carries an
             # `impact-index` artifact. A green merge-patch run can legitimately
             # publish nothing (cold-start skip), so candidate selection is by
-            # artifact presence, not by conclusion. No `|| true` anywhere: an
-            # auth/network failure must fail this step loudly, not be masked as
-            # "no baseline exists yet". A working call with zero matching runs
-            # still yields an empty string (exit 0).
-            gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
-              --workflow "$1" --limit 5 --json databaseId --jq '.[].databaseId' |
-            while read -r id; do
-              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" 2>/dev/null \
-                --jq '.artifacts[]?.name' | grep -qx 'impact-index' && { echo "$id"; break; }
+            # artifact presence, not by conclusion.
+            #
+            # Failure policy: the `gh run list` call may not be masked — an
+            # auth/network failure must kill this step loudly, not be disguised
+            # as "no baseline yet". The per-run artifacts probe is exempt from
+            # `set -e` by sitting in an `if` condition, but its own failure is
+            # still detected explicitly and aborts the step. Only a *genuine*
+            # empty result (no runs, or runs with no `impact-index` artifact)
+            # yields an empty string with exit 0.
+            cand="$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
+              --workflow "$1" --limit 5 --json databaseId --jq '.[].databaseId')"
+            printf '%s\n' "$cand" | while read -r id; do
+              names="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                --jq '.artifacts[]?.name')" || {
+                echo "!! artifacts probe failed for run $id" >&2; exit 1; }
+              if printf '%s\n' "$names" | grep -qx 'impact-index'; then
+                echo "$id"; break
+              fi
             done
           }
           ID_FULL=$(latest "impact-index.yml")
