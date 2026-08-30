@@ -63,9 +63,13 @@ jobs:
             done
           done
           if [ -n "$RUN_ID" ]; then
-            gh run download "$RUN_ID" -n impact-index -D ./idx
-            echo "db=./idx/root-index.sqlite" >> "$GITHUB_OUTPUT"
-            echo "Downloaded baseline index from run $RUN_ID (built from $(cat ./idx/built-from.txt 2>/dev/null || echo unknown))"
+            if gh run download "$RUN_ID" -n impact-index -D ./idx 2>/dev/null && [ -f ./idx/root-index.sqlite ]; then
+              echo "db=./idx/root-index.sqlite" >> "$GITHUB_OUTPUT"
+              echo "Downloaded baseline index from run $RUN_ID (built from $(cat ./idx/built-from.txt 2>/dev/null || echo unknown))"
+            else
+              echo "db=" >> "$GITHUB_OUTPUT"
+              echo "Run $RUN_ID has no baseline artifact (e.g. merge-patch skipped before first full rebuild) -> fall back to module suites"
+            fi
           else
             echo "db=" >> "$GITHUB_OUTPUT"
             echo "No baseline impact-index available yet -> will fall back to module suites"

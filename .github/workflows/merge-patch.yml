@@ -165,6 +165,7 @@ jobs:
 
       - name: Compute affected tests since last baseline commit
         id: affected
+        if: steps.baseline.outputs.db != ''
         run: |
           bash tools/test-graph/affected.sh \
             --db "${{ steps.baseline.outputs.db }}" \
@@ -181,7 +182,7 @@ jobs:
           echo "it=$IT" >> "$GITHUB_OUTPUT"
 
       - name: Run affected tests with per-test coverage
-        if: steps.affected.outputs.skip != '1'
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           cd "$GITHUB_WORKSPACE"
           # Restrict to the modules actually touched (real maven modules only),
@@ -193,18 +194,20 @@ jobs:
           UT="${{ steps.affected.outputs.ut }}"
           IT="${{ steps.affected.outputs.it }}"
           if [ -n "$UT" ]; then
-            "$MVN" -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+            # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
+            # and word-splitting must apply (a quoted "$MVN" would be one command).
+            $MVN -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
               -DfailIfNoTests=false test "-Dtest=$UT" \
               || echo "!! affected unit tests failed (see above) — coverage may be incomplete for this patch"
           fi
           if [ -n "$IT" ]; then
-            "$MVN" -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+            $MVN -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
               -DfailIfNoTests=false verify "-Dit.test=$IT" \
               || echo "!! affected integration tests failed (see above) — coverage may be incomplete for this patch"
           fi
 
       - name: Build per-module delta partials
-        if: steps.affected.outputs.skip != '1'
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           mkdir -p target/test-graph/deltas
           for mod in $(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt | sort -u); do
@@ -220,7 +223,7 @@ jobs:
           done
 
       - name: Merge deltas into baseline
-        if: steps.affected.outputs.skip != '1'
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           ARGS=("aggregate" "--out" "target/test-graph/root-index.sqlite")
           ARGS+=(--db "${{ steps.baseline.outputs.db }}")
@@ -232,19 +235,21 @@ jobs:
           tail -5 target/test-graph/aggregate.log
 
       - name: Validate patched index
-        if: steps.affected.outputs.skip != '1'
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite || true
 
       - name: Keep prior baseline when nothing was affected
-        if: steps.affected.outputs.skip == '1'
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip == '1'
         run: |
           mkdir -p target/test-graph
           cp "${{ steps.baseline.outputs.db }}" target/test-graph/root-index.sqlite
 
       - name: Record source commit
+        if: steps.baseline.outputs.db != ''
         run: echo "${{ github.sha }}" > target/test-graph/built-from.txt
 
       - name: Upload impact-index artifact
+        if: steps.baseline.outputs.db != ''
         uses: actions/upload-artifact@v7
         with:
           name: impact-index
