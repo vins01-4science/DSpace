@@ -185,6 +185,14 @@ jobs:
           echo "affected modules: $MODS"
           UT="${{ steps.affected.outputs.ut }}"
           IT="${{ steps.affected.outputs.it }}"
+          # Do NOT pass -am here. With -am, dspace-parent is rebuilt inside this
+          # reactor, which re-assembles testEnvironment.zip WITHOUT the
+          # org.dspace:dspace module (never built by a -am reactor) — that zip is
+          # incomplete (no config-definition.xml/dspace.cfg/solr), so every
+          # affected test errors with "DSpace home directory could not be
+          # determined". The install step above already put a complete zip (and
+          # all modules) into the local repo, so plain -pl resolves everything
+          # from m2, correctly and faster.
           if [ -n "$UT" ]; then
             # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
             # and word-splitting must apply (a quoted "$MVN" would be one command).
@@ -192,12 +200,12 @@ jobs:
             # A non-zero exit here FAILS the run. Test failures or a broken test
             # environment must surface loudly — a green run that silently lost all
             # per-test coverage was the original false-green bug of this workflow.
-            $MVN -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+            $MVN -pl "$MODS" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
               -DfailIfNoTests=false test "-Dtest=$UT" \
               || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
           fi
           if [ -n "$IT" ]; then
-            $MVN -pl "$MODS" -am -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+            $MVN -pl "$MODS" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
               -DfailIfNoTests=false verify "-Dit.test=$IT" \
               || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
           fi
