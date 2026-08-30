@@ -148,11 +148,19 @@ jobs:
           # Missing on `push` events (no inputs there) => falls back to main.
           BRANCH="${{ inputs.baseline_branch || 'main' }}"
           latest() {
-            # No `|| true`: a GH auth/network failure must fail this step loudly,
-            # not be masked as "no baseline exists yet". An empty result set from
-            # a working authenticated call still yields an empty string (exit 0).
+            # Newest successful run of $1 on $BRANCH that actually carries an
+            # `impact-index` artifact. A green merge-patch run can legitimately
+            # publish nothing (cold-start skip), so candidate selection is by
+            # artifact presence, not by conclusion. No `|| true` anywhere: an
+            # auth/network failure must fail this step loudly, not be masked as
+            # "no baseline exists yet". A working call with zero matching runs
+            # still yields an empty string (exit 0).
             gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
-              --workflow "$1" --limit 1 --json databaseId --jq '.[0].databaseId'
+              --workflow "$1" --limit 5 --json databaseId --jq '.[].databaseId' |
+            while read -r id; do
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" 2>/dev/null \
+                --jq '.artifacts[]?.name' | grep -qx 'impact-index' && { echo "$id"; break; }
+            done
           }
           ID_FULL=$(latest "impact-index.yml")
           ID_PATCH=$(latest "merge-patch.yml")
