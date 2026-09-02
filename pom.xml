@@ -170,6 +170,7 @@
                     <version>3.14.1</version>
                     <configuration>
                         <release>${java.version}</release>
+                        <staleMillis>3600000</staleMillis>
                         <!-- Turn on http://errorprone.info (requires fork=true & below compilerArgs)-->
                         <fork>true</fork>
                         <compilerArgs>
