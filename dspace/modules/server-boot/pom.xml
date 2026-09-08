@@ -35,6 +35,12 @@
             <groupId>org.dspace</groupId>
             <artifactId>dspace-server-webapp</artifactId>
         </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-devtools</artifactId>
+            <version>${spring-boot.version}</version>
+            <optional>true</optional>
+        </dependency>
 
         <!-- Test Dependencies -->
         <dependency>

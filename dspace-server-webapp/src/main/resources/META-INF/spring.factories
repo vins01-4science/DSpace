@@ -1,0 +1,2 @@
+org.springframework.boot.env.EnvironmentPostProcessor=org.dspace.app.devtools.DevToolsRestarterUrlSeeder
+org.springframework.context.ApplicationListener=org.dspace.app.devtools.DevToolsRootContextRegistrar
