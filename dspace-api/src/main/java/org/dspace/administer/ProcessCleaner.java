@@ -28,6 +28,7 @@ import org.dspace.utils.DSpace;
 
 /**
  * Script to cleanup the old processes in the specified state.
+ * Option parsing is delegated to Apache Commons CLI via the configuration class.
  *
  * @author Luca Giamminonni (luca.giamminonni at 4science.it)
  *
