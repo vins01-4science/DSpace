@@ -62,7 +62,7 @@ jobs:
           latest() { # $1=workflow file, $2=branch -> run id or empty
             local cand id names
             cand="$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$2" \
-              --status success --workflow "$1" --limit 5 \
+              --status success --workflow "$1" --limit 20 \
               --json databaseId --jq '.[].databaseId')" || {
                 echo "!! gh run list failed for $1 on $2" >&2; return 1; }
             [ -z "$cand" ] && return 0
@@ -109,12 +109,15 @@ jobs:
           # older branches, 0.8.15 on newer upstream) — see merge-patch.yml.
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
           fi
-          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          if [[ ! "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "!! could not resolve jacoco-maven-plugin version from pom.xml (got '$JV')" >&2
+            exit 1
+          fi
           echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
@@ -213,6 +216,15 @@ jobs:
               mvn -B -V install -P-assembly -pl "$MODULES" \
                 -DskipUnitTests=false -DskipIntegrationTests=false -DfailIfNoTests=false
             fi
+          fi
+
+          # Backstop: the computed lists can name stale/renamed classes, and
+          # -DfailIfNoTests=false would otherwise report green with zero tests.
+          # (The "Nothing to test" arm above exits 0 before reaching this.)
+          RAN=$(find . -path '*/target/*-reports/TEST-*.xml' -print 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${RAN:-0}" -eq 0 ]; then
+            echo "!! tests were selected but NO surefire/failsafe reports were produced — stale affected classes?" >&2
+            exit 1
           fi
 
       - name: Summarize
