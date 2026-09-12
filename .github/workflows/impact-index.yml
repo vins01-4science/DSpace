@@ -29,6 +29,14 @@ on:
 permissions:
   contents: read  # checkout + publish artifact
 
+# NOTE: deliberately no concurrency group shared with merge-patch.yml. A weekly
+# full rebuild may overlap a patch run; both publish the same `impact-index`
+# artifact name. This is safe because artifacts are addressed by run id, and a
+# patch always aggregates from the baseline artifact it downloaded (never from
+# another run's output). The only effect of an overlap is that consumers may
+# choose the more conservative of two sound indexes. Revisit if artifact
+# selection ever keys on name+time instead of run id.
+
 jobs:
   # Emit the build matrix: one cell per (module, shard). Shard counts are tuned
   # to each module's test volume; raise a number to spread that module's tests
@@ -101,8 +109,15 @@ jobs:
           M2="$HOME/.m2/repository"
           # Jacobo plugin version must follow pom.xml pluginManagement (see
           # merge-patch.yml: 0.8.14/0.8.15 depending on upstream point).
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/{n;p;}' pom.xml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          [ -n "$JV" ] || JV="0.8.14"
+          # Resolve the jacoco plugin version from the reactor pom (literal or
+          # ${property}); a structural pom change must not silently fall back.
+          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          if [[ "$JV" == *'${'* ]]; then
+            JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
+            JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
+          fi
+          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
             "org.jacoco:jacoco-maven-plugin:$JV" \
@@ -249,8 +264,15 @@ jobs:
       - name: Fetch test-graph tool dependencies (if not cached)
         run: |
           M2="$HOME/.m2/repository"
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/{n;p;}' pom.xml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          [ -n "$JV" ] || JV="0.8.14"
+          # Resolve the jacoco plugin version from the reactor pom (literal or
+          # ${property}); a structural pom change must not silently fall back.
+          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          if [[ "$JV" == *'${'* ]]; then
+            JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
+            JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
+          fi
+          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
             "org.jacoco:jacoco-maven-plugin:$JV" \
@@ -302,8 +324,15 @@ jobs:
       - name: Fetch test-graph tool dependencies (if not cached)
         run: |
           M2="$HOME/.m2/repository"
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/{n;p;}' pom.xml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          [ -n "$JV" ] || JV="0.8.14"
+          # Resolve the jacoco plugin version from the reactor pom (literal or
+          # ${property}); a structural pom change must not silently fall back.
+          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          if [[ "$JV" == *'${'* ]]; then
+            JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
+            JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
+          fi
+          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
             "org.ow2.asm:asm:9.7.1" \
@@ -337,7 +366,7 @@ jobs:
             --out target/test-graph/root-index.sqlite "${ARGS[@]}"
 
       - name: Validate test-impact index
-        run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite || true
+        run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite
 
       - name: Record source commit
         run: echo "${{ github.sha }}" > target/test-graph/built-from.txt

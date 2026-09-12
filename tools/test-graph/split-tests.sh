@@ -44,6 +44,7 @@ is_it() { [[ "$1" == IT* || "$1" == *IT || "$1" == *ITCase ]]; }
 
 UT=()
 IT=()
+UNMATCHED=()
 if [[ -d "$SRC" ]]; then
   while IFS= read -r f; do
     base="$(basename "$f" .java)"
@@ -52,6 +53,7 @@ if [[ -d "$SRC" ]]; then
     rel="${f#"$SRC"/}"; rel="${rel%.java}"; fqcn="${rel//\//.}"
     if is_it "$base"; then IT+=("$fqcn")
     elif is_ut "$base"; then UT+=("$fqcn")
+    else UNMATCHED+=("$fqcn")
     fi
   done < <(find "$SRC" -name '*.java' -type f)
 fi
@@ -76,3 +78,12 @@ for ((i=0; i<TOTAL; i++)); do
   t=$(grep -c . "$OUT_DIR/shard-$i-it.txt" 2>/dev/null || echo 0)
   echo "  shard $i: ut=$u it=$t"
 done
+
+# Classes matching neither surefire nor failsafe default includes are NOT
+# sharded: their coverage never enters the index. Loud warning (latent today —
+# all current DSpace test classes match — but a pom <include> change flips it).
+if ((${#UNMATCHED[@]} > 0)); then
+  echo "split-tests: WARNING: ${#UNMATCHED[@]} test source(s) match neither surefire nor failsafe default includes;" >&2
+  echo "split-tests:          they are NOT sharded and their coverage will be missing from the index:" >&2
+  printf '  %s\n' "${UNMATCHED[@]}" >&2
+fi

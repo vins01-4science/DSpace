@@ -1312,7 +1312,12 @@ public class TestGraph {
         candidateClasses.addAll(methodLinesMap.keySet());
         candidateClasses.addAll(classOnly);
         if (candidateClasses.isEmpty()) {
-            System.out.println("refine: no changed .java files or recognized config changes detected in diff");
+            // CSV mode is a machine interface: print NOTHING (not even to stderr —
+            // callers treat stderr as a tool failure). A silent, empty result is the
+            // correct answer when nothing changed.
+            if (!opts.containsKey("csv")) {
+                System.out.println("refine: no changed .java files or recognized config changes detected in diff");
+            }
             return;
         }
 
