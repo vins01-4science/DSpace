@@ -30,6 +30,8 @@ import org.dspace.utils.DSpace;
  * Script to cleanup the old processes in the specified state.
  * Runs as a DSpace CLI script (see {@link org.dspace.runner.ScriptLauncher}).
  * Only processes currently in the configured state are considered.
+ * The target state, optional "days" threshold and dry-run behaviour are all
+ * resolved from the CLI options in {@link ProcessCleanerCliConfiguration}.
  *
  * @author Luca Giamminonni (luca.giamminonni at 4science.it)
  *
