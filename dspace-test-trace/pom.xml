@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.dspace</groupId>
+    <artifactId>dspace-test-trace</artifactId>
+    <version>11.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>DSpace :: Test Trace (per-test coverage listener)</name>
+    <description>
+        JaCoCo-based per-test coverage listener. Dumps and resets the JaCoCo runtime
+        agent's execution data after every test so each test produces its own .exec file.
+        Used to build a test/class dependency graph for test impact analysis.
+    </description>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Provided by the JUnit Platform (Surefire/Spring) at test runtime. -->
+        <dependency>
+            <groupId>org.junit.platform</groupId>
+            <artifactId>junit-platform-launcher</artifactId>
+            <version>1.13.1</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+</project>

@@ -1,0 +1,263 @@
+# Merge Patch (baseline) — incremental update of the test-impact index on every
+# change that lands on `main`.
+#
+# Full rebuilds (impact-index.yml) are expensive (21+ sharded test jobs) and are
+# now only run weekly as a safety net. This workflow keeps the published
+# baseline fresh in between: it diffs the new HEAD against the commit the last
+# baseline was built from, re-runs ONLY the tests affected by that diff, and
+# merges their fresh coverage into the existing baseline.
+#
+# Why this is correct:
+#   - Patch semantics == `aggregate --db <baseline> --db2 <delta>`. cov_data is
+#     keyed by (class), each blob = per-test line sets. The union of baseline +
+#     delta is conservative: a re-run test's fresher lines replace the old ones
+#     (union), classes/tests not re-run keep their baseline entries, and the
+#     static tables (class_refs, property_impact, ...) are recomputed from the
+#     unioned inputs. Nothing is ever under-selected; over-conservative overlap
+#     is healed by the weekly full rebuild.
+#   - The PR gate (test-affected.yml) already validated the changes green when
+#     they merged, so this workflow may treat affected-test failures as coverage
+#     loss, not merge blockers.
+#
+# Output: a new `impact-index` artifact (root-index.sqlite + built-from.txt set
+# to the pushed SHA), same name/path as impact-index.yml so every consumer
+# (test-affected.yml) keeps working and always resolves the newest baseline.
+name: Merge Patch (baseline)
+
+on:
+  push:
+    branches: [main, task/test-class-graph-phase0]
+  workflow_dispatch:
+    inputs:
+      baseline_branch:
+        description: "Branch to resolve the latest impact-index baseline from (default: the branch this run is on)"
+        required: false
+
+permissions:
+  contents: read   # checkout + publish artifact
+  actions: read    # download the previous baseline artifact
+
+concurrency:
+  group: merge-patch
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MAVEN_OPTS: "-Xmx2048M"
+      MVN: "mvn -o -B"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # The jars the single-file TestGraph.java tool needs at runtime. Guarded:
+      # only fires mvn when a jar is genuinely missing (cold ~/.m2).
+      #
+      # NOTE: the Maven build-cache extension is deliberately NOT used here. It
+      # never restored in practice (each run reinstalls fresh SNAPSHOT artifacts,
+      # so the input checksum — and the dependency set — changes every run and the
+      # whole reactor recompiles anyway, c.f. "Recompiling the module because of
+      # changed dependency" / "Compiling 1784 source files"), and its plugin-config
+      # restore corrupted the forked test JVM's environment (all affected tests
+      # errored with "DSpace home directory could not be determined" while the
+      # same command passes locally). Deterministic, slower-but-correct.
+      - name: Fetch test-graph runtime deps (if not cached)
+        run: |
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.jacoco:jacoco-maven-plugin:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1" \
+            "org.apache.maven.plugins:maven-surefire-plugin:3.5.3" \
+            "org.apache.maven.plugins:maven-failsafe-plugin:3.5.3" \
+            "org.apache.maven.surefire:surefire-junit-platform:3.5.3" \
+            "org.apache.maven.surefire:surefire-junit4:3.5.3"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
+
+      - name: Install listener + test install (skip tests)
+        run: |
+          mvn -B -V install -f dspace-test-trace/pom.xml -DskipTests
+          mvn -B -V install -P-assembly -Ptest-class-graph \
+            -DskipTests -DskipUnitTests=true -DskipIntegrationTests=true \
+            -Denforcer.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true \
+            -Dxml.skip=true -Dspotbugs.skip=true -Dpmd.skip=true
+
+      - name: Download previous baseline (latest full or patch)
+        id: baseline
+        run: |
+          # Default = the branch this run is on (pushed ref or dispatched ref), so the
+          # baseline is looked up where that branch's own runs published one
+          # (feature branch validates pre-merge; main uses main's). An explicit
+          # workflow_dispatch input overrides it.
+          BRANCH="${{ inputs.baseline_branch || github.ref_name }}"
+          latest() {
+            # Newest successful run of $1 on $BRANCH that actually carries an
+            # `impact-index` artifact. A green merge-patch run can legitimately
+            # publish nothing (cold-start skip), so candidate selection is by
+            # artifact presence, not by conclusion.
+            #
+            # Failure policy: the `gh run list` call may not be masked — an
+            # auth/network failure must kill this step loudly, not be disguised
+            # as "no baseline yet". The per-run artifacts probe is exempt from
+            # `set -e` by sitting in an `if` condition, but its own failure is
+            # still detected explicitly and aborts the step. Only a *genuine*
+            # empty result (no runs, or runs with no `impact-index` artifact)
+            # yields an empty string with exit 0.
+            cand="$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
+              --workflow "$1" --limit 5 --json databaseId --jq '.[].databaseId')"
+            printf '%s\n' "$cand" | while read -r id; do
+              names="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                --jq '.artifacts[]?.name')" || {
+                echo "!! artifacts probe failed for run $id" >&2; exit 1; }
+              if printf '%s\n' "$names" | grep -qx 'impact-index'; then
+                echo "$id"; break
+              fi
+            done
+          }
+          ID_FULL=$(latest "impact-index.yml")
+          ID_PATCH=$(latest "merge-patch.yml")
+          RUN_ID=""
+          if [ -n "$ID_FULL" ] && [ -n "$ID_PATCH" ]; then
+            if [ "$ID_PATCH" -gt "$ID_FULL" ]; then RUN_ID="$ID_PATCH"; else RUN_ID="$ID_FULL"; fi
+          elif [ -n "$ID_FULL" ]; then RUN_ID="$ID_FULL"
+          elif [ -n "$ID_PATCH" ]; then RUN_ID="$ID_PATCH"; fi
+          if [ -z "$RUN_ID" ]; then
+            echo "No baseline index exists yet — skip patch (first weekly full rebuild will create it)."
+            exit 0
+          fi
+          gh run download "$RUN_ID" -n impact-index -D ./idx
+          BASE_SHA="$(cat ./idx/built-from.txt 2>/dev/null || true)"
+          if [ -z "$BASE_SHA" ]; then
+            echo "Baseline artifact lacks built-from.txt — cannot diff. Skip patch."
+            exit 0
+          fi
+          if [ "$BASE_SHA" = "${{ github.sha }}" ]; then
+            echo "Baseline already reflects this SHA — nothing to patch."
+            exit 0
+          fi
+          echo "db=$(pwd)/idx/root-index.sqlite" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Using baseline from run $RUN_ID (built from $BASE_SHA)"
+
+      - name: Compute affected tests since last baseline commit
+        id: affected
+        if: steps.baseline.outputs.db != ''
+        run: |
+          bash tools/test-graph/affected.sh \
+            --db "${{ steps.baseline.outputs.db }}" \
+            --base "${{ steps.baseline.outputs.base_sha }}" \
+            --head "${{ github.sha }}" \
+            --out target/test-graph/affected
+          UT="$(cat target/test-graph/affected/ut.csv)"
+          IT="$(cat target/test-graph/affected/it.csv)"
+          if [ -z "$UT" ] && [ -z "$IT" ]; then
+            echo "Nothing affected since ${{ steps.baseline.outputs.base_sha }} — baseline is already current."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ut=$UT" >> "$GITHUB_OUTPUT"
+          echo "it=$IT" >> "$GITHUB_OUTPUT"
+
+      - name: Run affected tests with per-test coverage
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # Restrict to the modules actually touched (real maven modules only),
+          # so unrelated modules are neither compiled nor (with -am) re-built.
+          MODS="$(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt \
+                  | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | sort -u | paste -sd, -)"
+          [ -z "$MODS" ] && MODS="dspace-api"
+          echo "affected modules: $MODS"
+          UT="${{ steps.affected.outputs.ut }}"
+          IT="${{ steps.affected.outputs.it }}"
+          # Do NOT pass -am here. With -am, dspace-parent is rebuilt inside this
+          # reactor, which re-assembles testEnvironment.zip WITHOUT the
+          # org.dspace:dspace module (never built by a -am reactor) — that zip is
+          # incomplete (no config-definition.xml/dspace.cfg/solr), so every
+          # affected test errors with "DSpace home directory could not be
+          # determined". The install step above already put a complete zip (and
+          # all modules) into the local repo, so plain -pl resolves everything
+          # from m2, correctly and faster.
+          if [ -n "$UT" ]; then
+            # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
+            # and word-splitting must apply (a quoted "$MVN" would be one command).
+            #
+            # A non-zero exit here FAILS the run. Test failures or a broken test
+            # environment must surface loudly — a green run that silently lost all
+            # per-test coverage was the original false-green bug of this workflow.
+            $MVN -pl "$MODS" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+              -DfailIfNoTests=false test "-Dtest=$UT" \
+              || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
+          fi
+          if [ -n "$IT" ]; then
+            $MVN -pl "$MODS" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+              -DfailIfNoTests=false verify "-Dit.test=$IT" \
+              || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
+          fi
+
+      - name: Build per-module delta partials
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
+        run: |
+          mkdir -p target/test-graph/deltas
+          for mod in $(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt | sort -u); do
+            [ -f "$mod/pom.xml" ] || continue
+            [ -d "$mod/target/per-test" ] || continue
+            n=$(find "$mod/target/per-test" -name '*.exec' | wc -l)
+            [ "$n" -gt 0 ] || { echo "no coverage for $mod"; continue; }
+            echo "delta partial for $mod ($n execs)"
+            # --skip-tests: static + config + build from the .exec files already
+            # produced above (no test re-run, per-test dir is preserved).
+            bash tools/test-graph/phase-module.sh "$mod" --skip-tests \
+              --db-out "target/test-graph/deltas/delta-$mod.sqlite"
+          done
+
+      - name: Merge deltas into baseline
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
+        run: |
+          ARGS=("aggregate" "--out" "target/test-graph/root-index.sqlite")
+          ARGS+=(--db "${{ steps.baseline.outputs.db }}")
+          i=2
+          for f in $(find target/test-graph/deltas -name 'delta-*.sqlite' | sort); do
+            ARGS+=(--db$i "$f"); i=$((i+1))
+          done
+          bash tools/test-graph/run.sh "${ARGS[@]}" > target/test-graph/aggregate.log
+          tail -5 target/test-graph/aggregate.log
+
+      - name: Validate patched index
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
+        run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite || true
+
+      - name: Keep prior baseline when nothing was affected
+        if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip == '1'
+        run: |
+          mkdir -p target/test-graph
+          cp "${{ steps.baseline.outputs.db }}" target/test-graph/root-index.sqlite
+
+      - name: Record source commit
+        if: steps.baseline.outputs.db != ''
+        run: echo "${{ github.sha }}" > target/test-graph/built-from.txt
+
+      - name: Upload impact-index artifact
+        if: steps.baseline.outputs.db != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: impact-index
+          path: |
+            target/test-graph/root-index.sqlite
+            target/test-graph/built-from.txt
+          retention-days: 90

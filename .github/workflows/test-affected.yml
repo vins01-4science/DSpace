@@ -1,0 +1,193 @@
+# Test Affected (PR gate) — runs ONLY the tests impacted by a pull request.
+#
+# Flow (matching the branch-from-`main` workflow):
+#   1. Download the baseline impact-index built from the branch this PR targets
+#      (impact-index.yml, published on `main` pushes). Falls back to `main`.
+#   2. Diff the PR (base...head) and, for every changed source/config/bean file,
+#      look up the impacted tests in the baseline index (tools/test-graph/affected.sh).
+#   3. Run only those tests:
+#        - unit tests always (root reactor, -Dtest=<csv>)
+#        - integration tests only when an affected test is an IT (-Dit.test=<csv>)
+#      If NO baseline is found (cold base branch), the honest gate is the FULL
+#      suite — without an index we cannot know what is affected. If a baseline
+#      exists but nothing is affected (docs-only / new file), fall back to
+#      running the full suite of the touched modules.
+#
+# This job does NOT rebuild the index and does NOT attach the JaCoCo agent;
+# it just re-runs the already-selected tests.
+name: Test Affected (PR)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read   # checkout + read PR metadata
+  actions: read    # download the impact-index artifact from another workflow run
+
+jobs:
+  affected-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MAVEN_OPTS: "-Xmx2048M"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ---- 1. download the baseline index from the targeted base branch ----
+      # The baseline is published by both impact-index.yml (weekly full rebuild)
+      # and merge-patch.yml (incremental per-merge updates); PRs must resolve the
+      # newest of the two on the base branch, falling back to `main`.
+      - name: Download baseline impact-index
+        id: baseline
+        run: |
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          RUN_ID=""
+          for B in "$BASE_BRANCH" main; do
+            for W in impact-index.yml merge-patch.yml; do
+              ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$B" \
+                    --workflow "$W" --status success --limit 1 \
+                    --json databaseId --jq '.[0].databaseId' || true)
+              if [ -n "$ID" ] && { [ -z "$RUN_ID" ] || [ "$ID" -gt "$RUN_ID" ]; }; then
+                RUN_ID="$ID"
+              fi
+            done
+          done
+          if [ -n "$RUN_ID" ]; then
+            if gh run download "$RUN_ID" -n impact-index -D ./idx 2>/dev/null && [ -f ./idx/root-index.sqlite ]; then
+              echo "db=./idx/root-index.sqlite" >> "$GITHUB_OUTPUT"
+              echo "Downloaded baseline index from run $RUN_ID (built from $(cat ./idx/built-from.txt 2>/dev/null || echo unknown))"
+            else
+              echo "db=" >> "$GITHUB_OUTPUT"
+              echo "Run $RUN_ID has no baseline artifact (e.g. merge-patch skipped before first full rebuild) -> fall back to module suites"
+            fi
+          else
+            echo "db=" >> "$GITHUB_OUTPUT"
+            echo "No baseline impact-index available yet -> will fall back to module suites"
+          fi
+
+      # ---- 2. fetch the test-graph runtime deps so the impacted lookup can run ----
+      # The baseline download from another job is only usable if the single-file
+      # TestGraph tool can run. Guard against a maven cache that lacks the jars
+      # (merge-patch.yml does the same): a silent tool failure used to surface as
+      # "0 affected tests" -> silent fallback to whole-module suites.
+      - name: Fetch test-graph runtime deps (if not cached)
+        run: |
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.jacoco:jacoco-maven-plugin:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1" \
+            "org.apache.maven.plugins:maven-surefire-plugin:3.5.3" \
+            "org.apache.maven.plugins:maven-failsafe-plugin:3.5.3" \
+            "org.apache.maven.surefire:surefire-junit-platform:3.5.3" \
+            "org.apache.maven.surefire:surefire-junit4:3.5.3"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
+
+      # ---- 3. compute affected tests from the diff ----
+      - name: Compute affected tests
+        id: affected
+        run: |
+          DB="${{ steps.baseline.outputs.db }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$DB" ]; then
+            bash tools/test-graph/affected.sh --db "$DB" --base "$BASE_SHA" --head "$HEAD_SHA" \
+              --out target/test-graph/affected
+            UT_CSV="$(cat target/test-graph/affected/ut.csv)"
+            IT_CSV="$(cat target/test-graph/affected/it.csv)"
+          else
+            UT_CSV=""; IT_CSV=""
+          fi
+          {
+            echo "ut_csv<<EOF"; echo "$UT_CSV"; echo "EOF"
+            echo "it_csv<<EOF"; echo "$IT_CSV"; echo "EOF"
+            if [ -n "$DB" ]; then
+              echo "baseline_found=true"
+            else
+              echo "baseline_found=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- 4. run only the affected tests (with module-suite fallback) ----
+      - name: Run affected tests
+        run: |
+          UT_CSV="${{ steps.affected.outputs.ut_csv }}"
+          IT_CSV="${{ steps.affected.outputs.it_csv }}"
+          BASELINE_FOUND="${{ steps.affected.outputs.baseline_found }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          if [ "$BASELINE_FOUND" = "false" ]; then
+            # No baseline impact-index yet — we cannot compute what is affected,
+            # so the honest gate is the FULL suite (the pre-impact-testing build).
+            echo "No baseline impact-index found -> running the FULL suite (whole reactor, UT + IT)."
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
+              -DfailIfNoTests=false
+          elif [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then
+            echo "Running UT $UT_CSV + IT $IT_CSV"
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DfailIfNoTests=false \
+              -Dtest="$UT_CSV" -DskipIntegrationTests=false -Dit.test="$IT_CSV"
+          elif [ -n "$UT_CSV" ]; then
+            echo "Running UT $UT_CSV"
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DfailIfNoTests=false \
+              -Dtest="$UT_CSV" -DskipIntegrationTests=true
+          elif [ -n "$IT_CSV" ]; then
+            echo "Running IT $IT_CSV"
+            mvn -B -V install -P-assembly -DskipIntegrationTests=false -DfailIfNoTests=false \
+              -Dit.test="$IT_CSV" -DskipUnitTests=true
+          else
+            # Baseline exists but nothing is affected by the diff:
+            #   - docs-only / new files              -> nothing to test
+            #   - source changes missed by the index -> touched modules' suites.
+            # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
+            # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
+            # determined" failure seen in merge-patch). Install the reactor first
+            # (this also materializes the complete zip in local m2), THEN test -pl.
+            MODULES=$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA" \
+                        | cut -d/ -f1 | grep '^dspace' | sort -u | paste -sd, -)
+            if [ -z "$MODULES" ]; then
+              echo "Nothing to test (no source/config changes)."
+              exit 0
+            fi
+            echo "Falling back to full suites of modules: $MODULES"
+            mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
+              -DfailIfNoTests=false
+            mvn -B -V install -P-assembly -pl "$MODULES" \
+              -DskipUnitTests=false -DskipIntegrationTests=true -DfailIfNoTests=false
+          fi
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Test Affected (PR)"
+            echo ""
+            echo "Unit tests: \`${{ steps.affected.outputs.ut_csv }}\`"
+            echo "Integration tests: \`${{ steps.affected.outputs.it_csv }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload affected-test list
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: affected-tests
+          path: target/test-graph/affected
+          retention-days: 14
