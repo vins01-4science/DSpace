@@ -121,14 +121,22 @@ jobs:
             # yields an empty string with exit 0.
             cand="$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
               --workflow "$1" --limit 5 --json databaseId --jq '.[].databaseId')"
-            printf '%s\n' "$cand" | while read -r id; do
+            # `cand` may be genuinely empty (cold branch: zero successful runs).
+            # A raw `printf '%s\n' "$cand"` would emit ONE blank line, making the
+            # loop probe run "" and hit HTTP 404 — a hard failure on the exact
+            # cold-start path this function exists to detect. Guard it (and blank
+            # ids) explicitly. `gh run list` itself is still unmasked: an
+            # auth/network failure keeps killing the step loudly.
+            if [ -z "$cand" ]; then return 0; fi
+            while IFS= read -r id; do
+              [ -z "$id" ] && continue
               names="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
                 --jq '.artifacts[]?.name')" || {
                 echo "!! artifacts probe failed for run $id" >&2; exit 1; }
               if printf '%s\n' "$names" | grep -qx 'impact-index'; then
                 echo "$id"; break
               fi
-            done
+            done <<< "$cand"
           }
           ID_FULL=$(latest "impact-index.yml")
           ID_PATCH=$(latest "merge-patch.yml")
