@@ -74,9 +74,17 @@ jobs:
       - name: Fetch test-graph runtime deps (if not cached)
         run: |
           M2="$HOME/.m2/repository"
+          # The reactor's JaCoCo coverage profiles (active when tests run) bind
+          # jacoco-maven-plugin at the version pinned in pom.xml pluginManagement
+          # (0.8.14 on older branches, 0.8.15 on newer upstream). Resolve it from
+          # the pom — hardcoding it made the OFFLINE `mvn -o` runs die with
+          # "Plugin org.jacoco:jacoco-maven-plugin:<pin> could not be resolved"
+          # as soon as an older feature branch got merged onto newer main.
+          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/{n;p;}' pom.xml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          [ -n "$JV" ] || JV="0.8.14"
           for artifact in \
-            "org.jacoco:org.jacoco.core:0.8.14" \
-            "org.jacoco:jacoco-maven-plugin:0.8.14" \
+            "org.jacoco:org.jacoco.core:$JV" \
+            "org.jacoco:jacoco-maven-plugin:$JV" \
             "org.ow2.asm:asm:9.7.1" \
             "org.xerial:sqlite-jdbc:3.21.0.1" \
             "org.apache.maven.plugins:maven-surefire-plugin:3.5.3" \
