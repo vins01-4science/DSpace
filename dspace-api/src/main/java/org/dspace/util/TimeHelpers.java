@@ -11,6 +11,7 @@ import java.time.LocalDateTime;
 
 /**
  * Various manipulations of dates and times.
+ * All methods are static — this is a stateless utility class.
  *
  * @author mwood
  */
