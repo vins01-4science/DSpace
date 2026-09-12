@@ -58,7 +58,7 @@ jobs:
             for W in impact-index.yml merge-patch.yml; do
               ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$B" \
                     --workflow "$W" --status success --limit 1 \
-                    --json databaseId --jq '.[0].databaseId' || true)
+                    --json databaseId --jq '.[0].databaseId // empty' || true)
               if [ -n "$ID" ] && { [ -z "$RUN_ID" ] || [ "$ID" -gt "$RUN_ID" ]; }; then
                 RUN_ID="$ID"
               fi
