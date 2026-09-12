@@ -82,12 +82,15 @@ jobs:
           # as soon as an older feature branch got merged onto newer main.
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
           fi
-          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          if [[ ! "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "!! could not resolve jacoco-maven-plugin version from pom.xml (got '$JV')" >&2
+            exit 1
+          fi
           echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
@@ -135,7 +138,7 @@ jobs:
             # empty result (no runs, or runs with no `impact-index` artifact)
             # yields an empty string with exit 0.
             cand="$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$BRANCH" --status success \
-              --workflow "$1" --limit 5 --json databaseId --jq '.[].databaseId')"
+              --workflow "$1" --limit 20 --json databaseId --jq '.[].databaseId')"
             # `cand` may be genuinely empty (cold branch: zero successful runs).
             # A raw `printf '%s\n' "$cand"` would emit ONE blank line, making the
             # loop probe run "" and hit HTTP 404 — a hard failure on the exact
@@ -200,16 +203,14 @@ jobs:
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           cd "$GITHUB_WORKSPACE"
-          # Restrict to the modules actually touched (real maven modules only),
-          # so unrelated modules are neither compiled nor (with -am) re-built.
-          MODS="$(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt \
-                  | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | sort -u | paste -sd, -)"
-          # No hardcoded module fallback: when the touched paths do not resolve
-          # to real modules, run across the reactor instead (the -Dtest/-Dit.test
-          # filters still restrict execution to the computed affected set).
-          PL_ARGS=()
-          if [ -n "$MODS" ]; then PL_ARGS=(-pl "$MODS"); echo "affected modules: $MODS"
-          else echo "affected modules: (none resolved) -> running across the reactor"; fi
+          # Deliberately do NOT narrow with -pl. modules.txt maps changed FILES to
+          # modules and under-covers the affected set: dspace/config/* maps to the
+          # pom-only `dspace` module (which hosts no tests -> zero executed), and a
+          # test in one module can be impacted by a source change in another (e.g.
+          # Context.java in dspace-api impacts org.dspace.app.rest.* in
+          # dspace-server-webapp). Run reactor-wide; -Dtest/-Dit.test still bound
+          # execution to the computed set, and every module is already installed
+          # into the local repo, so this only recompiles incrementally.
           UT="${{ steps.affected.outputs.ut }}"
           IT="${{ steps.affected.outputs.it }}"
           # Do NOT pass -am here. With -am, dspace-parent is rebuilt inside this
@@ -218,8 +219,8 @@ jobs:
           # incomplete (no config-definition.xml/dspace.cfg/solr), so every
           # affected test errors with "DSpace home directory could not be
           # determined". The install step above already put a complete zip (and
-          # all modules) into the local repo, so plain -pl resolves everything
-          # from m2, correctly and faster.
+          # all modules) into the local repo, so the reactor resolves everything
+          # from m2.
           if [ -n "$UT" ]; then
             # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
             # and word-splitting must apply (a quoted "$MVN" would be one command).
@@ -227,12 +228,12 @@ jobs:
             # A non-zero exit here FAILS the run. Test failures or a broken test
             # environment must surface loudly — a green run that silently lost all
             # per-test coverage was the original false-green bug of this workflow.
-            $MVN "${PL_ARGS[@]}" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+            $MVN -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
               -DfailIfNoTests=false test "-Dtest=$UT" \
               || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
           fi
           if [ -n "$IT" ]; then
-            $MVN "${PL_ARGS[@]}" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+            $MVN -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
               -DfailIfNoTests=false verify "-Dit.test=$IT" \
               || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
           fi
@@ -242,7 +243,7 @@ jobs:
         run: |
           mkdir -p target/test-graph/deltas
           total=0
-          # Scan every dspace* module dir: with a reactor-wide run (PL_ARGS empty)
+          # Scan every dspace* module dir: the test run is reactor-wide, so
           # the .exec files can live in any module, not just those in modules.txt.
           for dir in $(ls -d dspace*/ 2>/dev/null); do
             mod="${dir%/}"

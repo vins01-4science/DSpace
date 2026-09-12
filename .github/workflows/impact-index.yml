@@ -111,12 +111,15 @@ jobs:
           # merge-patch.yml: 0.8.14/0.8.15 depending on upstream point).
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
           fi
-          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          if [[ ! "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "!! could not resolve jacoco-maven-plugin version from pom.xml (got '$JV')" >&2
+            exit 1
+          fi
           echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
@@ -266,12 +269,15 @@ jobs:
           M2="$HOME/.m2/repository"
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
           fi
-          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          if [[ ! "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "!! could not resolve jacoco-maven-plugin version from pom.xml (got '$JV')" >&2
+            exit 1
+          fi
           echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
@@ -326,12 +332,15 @@ jobs:
           M2="$HOME/.m2/repository"
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
           fi
-          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          if [[ ! "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "!! could not resolve jacoco-maven-plugin version from pom.xml (got '$JV')" >&2
+            exit 1
+          fi
           echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \

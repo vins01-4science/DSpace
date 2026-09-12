@@ -43,11 +43,16 @@ fi
 TG="$REPO/tools/test-graph/run.sh"
 mkdir -p "$OUT_DIR"
 
-# A stale/rewritten baseline (base not an ancestor of head) would make the diff
-# meaningless. Fail loud instead of silently diffing unrelated histories.
-if ! git merge-base --is-ancestor "$BASE" "$HEAD" 2>/dev/null; then
-  echo "!! --base $BASE is not an ancestor of --head $HEAD (stale baseline or rewritten history?)" >&2
+# The three-dot diff below already diffs from the merge-base, so a PR whose base
+# branch advanced after the fork point (a normal stale PR) is handled correctly.
+# Only unrelated histories are an error; a moved base tip is a loud warning, not
+# a hard failure (failing here turned every stale PR red — round-2 finding).
+MB="$(git merge-base "$BASE" "$HEAD" 2>/dev/null)" || {
+  echo "!! --base $BASE and --head $HEAD have no common ancestor — refusing to diff" >&2
   exit 1
+}
+if [ "$MB" != "$BASE" ]; then
+  echo "!! note: --base $BASE is not an ancestor of --head $HEAD (baseline tip moved); diffing from merge-base $MB" >&2
 fi
 if ! DIFF_LIST="$(git diff --name-only --diff-filter=ADMR "$BASE...$HEAD" 2>&1)"; then
   echo "!! git diff $BASE...$HEAD failed: $DIFF_LIST" >&2
