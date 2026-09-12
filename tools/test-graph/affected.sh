@@ -62,6 +62,14 @@ is_it_class() {
 
 declare -A ALL=()
 declare -A MODS=()
+ERR_LOG="$OUT_DIR/impacted.err"
+: > "$ERR_LOG"
+
+impacted_for() { # args... -> feed stdout into the caller's read loop
+  if ! "$TG" "$@" 2>>"$ERR_LOG"; then
+    echo "!! $TG $* FAILED (see $ERR_LOG)" >&2
+  fi
+}
 
 for f in "${FILES[@]:-}"; do
   [[ -z "$f" ]] && continue
@@ -72,15 +80,15 @@ for f in "${FILES[@]:-}"; do
     fi
     while IFS= read -r t; do
       [[ -n "$t" ]] && ALL["$t"]=1
-    done < <("$TG" impacted --csv --db "$DB" --file "$REPO/$f" 2>/dev/null || true)
+    done < <(impacted_for impacted --csv --db "$DB" --file "$REPO/$f")
   elif is_cfg "$f"; then
     while IFS= read -r t; do
       [[ -n "$t" ]] && ALL["$t"]=1
-    done < <("$TG" impacted --csv --db "$DB" --configfile "$REPO/$f" 2>/dev/null || true)
+    done < <(impacted_for impacted --csv --db "$DB" --configfile "$REPO/$f")
   elif is_bean_xml "$f"; then
     while IFS= read -r t; do
       [[ -n "$t" ]] && ALL["$t"]=1
-    done < <("$TG" impacted --csv --db "$DB" --beanfile "$REPO/$f" 2>/dev/null || true)
+    done < <(impacted_for impacted --csv --db "$DB" --beanfile "$REPO/$f")
   elif [[ "$f" == *.xml ]]; then
     # non-spring XML metadata/form config (submission-forms.xml, item-submission.xml,
     # dspace/config/registries/*.xml) — mapped to tests via the curated consumer-class map.
@@ -88,10 +96,16 @@ for f in "${FILES[@]:-}"; do
     # degrades to the class-level `impacted --configfile` set when coverage is absent.
     while IFS= read -r t; do
       [[ -n "$t" ]] && ALL["$t"]=1
-    done < <("$TG" refine --csv --db "$DB" --configfile "$REPO/$f" \
-                   --base "$BASE" --head "$HEAD" 2>/dev/null || true)
+    done < <(impacted_for refine --csv --db "$DB" --configfile "$REPO/$f" \
+                    --base "$BASE" --head "$HEAD")
   fi
 done
+
+if [ -s "$ERR_LOG" ]; then
+  echo "!! test-graph tool emitted errors during impacted lookup (starting with):" >&2
+  sed -n '1,10p' "$ERR_LOG" >&2
+fi
+: > "$ERR_LOG"    # reset for the next run
 
 UT=()
 IT=()

@@ -77,7 +77,31 @@ jobs:
             echo "No baseline impact-index available yet -> will fall back to module suites"
           fi
 
-      # ---- 2. compute affected tests from the diff ----
+      # ---- 2. fetch the test-graph runtime deps so the impacted lookup can run ----
+      # The baseline download from another job is only usable if the single-file
+      # TestGraph tool can run. Guard against a maven cache that lacks the jars
+      # (merge-patch.yml does the same): a silent tool failure used to surface as
+      # "0 affected tests" -> silent fallback to whole-module suites.
+      - name: Fetch test-graph runtime deps (if not cached)
+        run: |
+          M2="$HOME/.m2/repository"
+          for artifact in \
+            "org.jacoco:org.jacoco.core:0.8.14" \
+            "org.jacoco:jacoco-maven-plugin:0.8.14" \
+            "org.ow2.asm:asm:9.7.1" \
+            "org.xerial:sqlite-jdbc:3.21.0.1" \
+            "org.apache.maven.plugins:maven-surefire-plugin:3.5.3" \
+            "org.apache.maven.plugins:maven-failsafe-plugin:3.5.3" \
+            "org.apache.maven.surefire:surefire-junit-platform:3.5.3" \
+            "org.apache.maven.surefire:surefire-junit4:3.5.3"; do
+            g="${artifact%%:*}"; rest="${artifact#*:}"; a="${rest%%:*}"; v="${rest#*:}"
+            if [ ! -f "$M2/${g//.//}/$a/$v/$a-$v.jar" ]; then
+              echo "fetching $artifact"
+              mvn -B -V dependency:get -Dartifact="$artifact"
+            fi
+          done
+
+      # ---- 3. compute affected tests from the diff ----
       - name: Compute affected tests
         id: affected
         run: |
@@ -102,7 +126,7 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-      # ---- 3. run only the affected tests (with module-suite fallback) ----
+      # ---- 4. run only the affected tests (with module-suite fallback) ----
       - name: Run affected tests
         run: |
           UT_CSV="${{ steps.affected.outputs.ut_csv }}"
