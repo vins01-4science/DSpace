@@ -48,6 +48,18 @@ MVN="${MVN:-mvn}"
 # treated as a single command name).
 read -r -a MVN_ARR <<< "$MVN"
 
+TEST_FAIL=0
+# Run tests but NEVER abort the shard on failure: a teardown flake or real test
+# failure still produced per-test .exec coverage; the PR gate re-runs the
+# affected tests and surfaces failures. This matches the documented contract
+# ("a shard's test failure does not fail the job").
+mvn_tests() {
+  "${MVN_ARR[@]}" "$@" || {
+    TEST_FAIL=1
+    echo "phase-module: TESTS FAILED (exit $?) - recording, continuing to build partial index" >&2
+  }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --shard)  SHARD="$2"; TOTAL="$3"; shift 3 ;;
@@ -79,28 +91,25 @@ elif [[ -n "$UT_LIST" || -n "$IT_LIST" ]]; then
   # let `build` produce a delta partial whose coverage is absent for everything
   # else. Aggregating it into the existing baseline refreshes just those classes.
   if [[ -n "$UT_LIST" ]]; then
-    "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+    mvn_tests -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
       test "-Dtest=$UT_LIST"
   fi
   if [[ "$RUN_IT" -eq 1 && -n "$IT_LIST" ]]; then
-    "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+    mvn_tests -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
       verify "-Dit.test=$IT_LIST"
   fi
 elif [[ -n "$SHARD" && -n "$TOTAL" ]]; then
   bash "$REPO/tools/test-graph/split-tests.sh" --module "$MODULE" --total "$TOTAL"
-  # Pass the test list inline (comma-separated FQCNs). Surefire/Failsafe's
-  # `-Dtest=@file` form is unreliable in this build, but an inline `-Dtest`
-  # list works from any CWD, so we build it from the shard file.
   UT_REL="target/test-graph/shard-$((SHARD-1))-ut.txt"
   IT_REL="target/test-graph/shard-$((SHARD-1))-it.txt"
   if [[ -s "$MODULE/$UT_REL" ]]; then
     UT_LIST="$(paste -sd, "$MODULE/$UT_REL")"
-    "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+    mvn_tests -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
       test "-Dtest=$UT_LIST"
   fi
   if [[ "$RUN_IT" -eq 1 && -s "$MODULE/$IT_REL" ]]; then
     IT_LIST="$(paste -sd, "$MODULE/$IT_REL")"
-    "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+    mvn_tests -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
       verify "-Dit.test=$IT_LIST"
   fi
   if [[ ! -s "$MODULE/$UT_REL" && ! -s "$MODULE/$IT_REL" ]]; then
@@ -115,10 +124,10 @@ elif [[ -n "$SHARD" && -n "$TOTAL" ]]; then
   fi
 else
   if [[ "$RUN_IT" -eq 1 ]]; then
-    "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=false \
+    mvn_tests -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=false \
       verify
   else
-    "${MVN_ARR[@]}" -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+    mvn_tests -pl "$MODULE" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
       test
   fi
 fi
@@ -150,3 +159,7 @@ DB="${DB_OUT:-$REPO/$MODULE/target/test-graph/impact-index.sqlite}"
 "$TG" build --module "$MODULE" --per-test "$PER_TEST" \
     --classes "$REPO/$MODULE/target/classes:$REPO/$MODULE/target/test-classes" --db "$DB"
 echo "phase-module: wrote $DB"
+
+if [[ "$TEST_FAIL" -eq 1 ]]; then
+  echo "phase-module: partial index built despite test failures in $MODULE (shard ${SHARD:-all}/${TOTAL:-all}) - failures must be surfaced by the PR gate" >&2
+fi
