@@ -28,6 +28,11 @@ import org.dspace.utils.DSpace;
 
 /**
  * Script to cleanup the old processes in the specified state.
+ * <p>
+ * Processes older than the configured number of days (default 14, configurable
+ * through the {@code process-cleaner.days} property) and matching the given
+ * status flags are removed; the check can target failed and/or running
+ * processes only, or fall back to completed processes when no flag is supplied.
  *
  * @author Luca Giamminonni (luca.giamminonni at 4science.it)
  *
