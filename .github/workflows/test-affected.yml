@@ -54,11 +54,31 @@ jobs:
         run: |
           BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
           RUN_ID=""
+          # Newest successful run on a branch that ACTUALLY carries the
+          # impact-index artifact. A green merge-patch run can legitimately
+          # publish nothing (cold skip), so conclusion alone is not enough.
+          # Genuine gh failures abort the step (auth/network must not be
+          # disguised as "no baseline").
+          latest() { # $1=workflow file, $2=branch -> run id or empty
+            local cand id names
+            cand="$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$2" \
+              --status success --workflow "$1" --limit 5 \
+              --json databaseId --jq '.[].databaseId')" || {
+                echo "!! gh run list failed for $1 on $2" >&2; return 1; }
+            [ -z "$cand" ] && return 0
+            while read -r id; do
+              [ -z "$id" ] && continue
+              names="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                --jq '.artifacts[]?.name')" || {
+                  echo "!! artifacts probe failed for run $id" >&2; return 1; }
+              if printf '%s\n' "$names" | grep -qx 'impact-index'; then
+                echo "$id"; return 0
+              fi
+            done <<< "$cand"
+          }
           for B in "$BASE_BRANCH" main; do
             for W in impact-index.yml merge-patch.yml; do
-              ID=$(gh run list --repo "$GITHUB_REPOSITORY" --branch "$B" \
-                    --workflow "$W" --status success --limit 1 \
-                    --json databaseId --jq '.[0].databaseId // empty' || true)
+              ID="$(latest "$W" "$B")" || exit 1
               if [ -n "$ID" ] && { [ -z "$RUN_ID" ] || [ "$ID" -gt "$RUN_ID" ]; }; then
                 RUN_ID="$ID"
               fi
@@ -70,11 +90,11 @@ jobs:
               echo "Downloaded baseline index from run $RUN_ID (built from $(cat ./idx/built-from.txt 2>/dev/null || echo unknown))"
             else
               echo "db=" >> "$GITHUB_OUTPUT"
-              echo "Run $RUN_ID has no baseline artifact (e.g. merge-patch skipped before first full rebuild) -> fall back to module suites"
+              echo "Run $RUN_ID baseline download failed -> fall back to the full suite"
             fi
           else
             echo "db=" >> "$GITHUB_OUTPUT"
-            echo "No baseline impact-index available yet -> will fall back to module suites"
+            echo "No baseline impact-index available yet -> will fall back to the full suite"
           fi
 
       # ---- 2. fetch the test-graph runtime deps so the impacted lookup can run ----
@@ -87,8 +107,15 @@ jobs:
           M2="$HOME/.m2/repository"
           # Jacobo plugin version must follow pom.xml pluginManagement (0.8.14 on
           # older branches, 0.8.15 on newer upstream) — see merge-patch.yml.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/{n;p;}' pom.xml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          [ -n "$JV" ] || JV="0.8.14"
+          # Resolve the jacoco plugin version from the reactor pom (literal or
+          # ${property}); a structural pom change must not silently fall back.
+          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          if [[ "$JV" == *'${'* ]]; then
+            JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
+            JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
+          fi
+          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
             "org.jacoco:jacoco-maven-plugin:$JV" \
@@ -159,23 +186,33 @@ jobs:
               -Dit.test="$IT_CSV" -DskipUnitTests=true
           else
             # Baseline exists but nothing is affected by the diff:
+            #   - high-blast-radius change (any pom.xml / shared config tree) ->
+            #     everything may be affected: run the FULL reactor UT+IT.
             #   - docs-only / new files              -> nothing to test
             #   - source changes missed by the index -> touched modules' suites.
-            # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
-            # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
-            # determined" failure seen in merge-patch). Install the reactor first
-            # (this also materializes the complete zip in local m2), THEN test -pl.
-            MODULES=$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA" \
-                        | cut -d/ -f1 | grep '^dspace' | sort -u | paste -sd, -)
-            if [ -z "$MODULES" ]; then
-              echo "Nothing to test (no source/config changes)."
-              exit 0
+            CHANGED="$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA")" || {
+              echo "!! git diff $BASE_SHA...$HEAD_SHA failed" >&2; exit 1; }
+            if printf '%s\n' "$CHANGED" | grep -qE '(^|/)pom\.xml$|^dspace/config/'; then
+              echo "High-blast-radius change (pom.xml or dspace/config) -> running the FULL reactor suite (UT + IT)."
+              mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
+                -DfailIfNoTests=false
+            else
+              # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
+              # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
+              # determined" failure seen in merge-patch). Install the reactor first
+              # (this also materializes the complete zip in local m2), THEN test -pl.
+              MODULES=$(printf '%s\n' "$CHANGED" | cut -d/ -f1 | grep '^dspace' | sort -u \
+                        | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, -)
+              if [ -z "$MODULES" ]; then
+                echo "Nothing to test (no source/config changes)."
+                exit 0
+              fi
+              echo "Falling back to full suites (UT + IT) of modules: $MODULES"
+              mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
+                -DfailIfNoTests=false
+              mvn -B -V install -P-assembly -pl "$MODULES" \
+                -DskipUnitTests=false -DskipIntegrationTests=false -DfailIfNoTests=false
             fi
-            echo "Falling back to full suites of modules: $MODULES"
-            mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
-              -DfailIfNoTests=false
-            mvn -B -V install -P-assembly -pl "$MODULES" \
-              -DskipUnitTests=false -DskipIntegrationTests=true -DfailIfNoTests=false
           fi
 
       - name: Summarize

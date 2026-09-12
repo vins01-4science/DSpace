@@ -43,7 +43,17 @@ fi
 TG="$REPO/tools/test-graph/run.sh"
 mkdir -p "$OUT_DIR"
 
-mapfile -t FILES < <(git diff --name-only --diff-filter=ADMR "$BASE...$HEAD" 2>/dev/null || true)
+# A stale/rewritten baseline (base not an ancestor of head) would make the diff
+# meaningless. Fail loud instead of silently diffing unrelated histories.
+if ! git merge-base --is-ancestor "$BASE" "$HEAD" 2>/dev/null; then
+  echo "!! --base $BASE is not an ancestor of --head $HEAD (stale baseline or rewritten history?)" >&2
+  exit 1
+fi
+if ! DIFF_LIST="$(git diff --name-only --diff-filter=ADMR "$BASE...$HEAD" 2>&1)"; then
+  echo "!! git diff $BASE...$HEAD failed: $DIFF_LIST" >&2
+  exit 1
+fi
+mapfile -t FILES <<< "$DIFF_LIST"
 
 is_java_src()  { [[ "$1" == */src/main/java/*.java || "$1" == */src/test/java/*.java ]]; }
 is_test_file() { [[ "$1" == */src/test/java/*.java ]]; }
@@ -71,6 +81,18 @@ impacted_for() { # args... -> feed stdout into the caller's read loop
   fi
 }
 
+BAD_LINES=0
+add_line() { # accept only class / class.method tokens; anything else = tool misbehavior
+  local t="$1"
+  [[ -z "$t" ]] && return 0
+  if [[ "$t" =~ ^[A-Za-z_$][A-Za-z0-9_$]*(\.[A-Za-z0-9_$]+)*$ ]]; then
+    ALL["$t"]=1
+  else
+    echo "!! ignoring non-test line from test-graph tool: '$t'" >&2
+    BAD_LINES=1
+  fi
+}
+
 for f in "${FILES[@]:-}"; do
   [[ -z "$f" ]] && continue
   MODS["$(module_of "$f")"]=1
@@ -79,15 +101,15 @@ for f in "${FILES[@]:-}"; do
       ALL["$(class_from_file "$f")"]=1   # a changed test must re-run itself
     fi
     while IFS= read -r t; do
-      [[ -n "$t" ]] && ALL["$t"]=1
+      add_line "$t"
     done < <(impacted_for impacted --csv --db "$DB" --file "$REPO/$f")
   elif is_cfg "$f"; then
     while IFS= read -r t; do
-      [[ -n "$t" ]] && ALL["$t"]=1
+      add_line "$t"
     done < <(impacted_for impacted --csv --db "$DB" --configfile "$REPO/$f")
   elif is_bean_xml "$f"; then
     while IFS= read -r t; do
-      [[ -n "$t" ]] && ALL["$t"]=1
+      add_line "$t"
     done < <(impacted_for impacted --csv --db "$DB" --beanfile "$REPO/$f")
   elif [[ "$f" == *.xml ]]; then
     # non-spring XML metadata/form config (submission-forms.xml, item-submission.xml,
@@ -95,7 +117,7 @@ for f in "${FILES[@]:-}"; do
     # Method-level `refine --configfile` reads line coverage straight from the index and
     # degrades to the class-level `impacted --configfile` set when coverage is absent.
     while IFS= read -r t; do
-      [[ -n "$t" ]] && ALL["$t"]=1
+      add_line "$t"
     done < <(impacted_for refine --csv --db "$DB" --configfile "$REPO/$f" \
                     --base "$BASE" --head "$HEAD")
   fi
@@ -104,8 +126,13 @@ done
 if [ -s "$ERR_LOG" ]; then
   echo "!! test-graph tool emitted errors during impacted lookup (starting with):" >&2
   sed -n '1,10p' "$ERR_LOG" >&2
+  echo "!! refusing to emit a possibly incomplete affected set" >&2
+  exit 1
 fi
-: > "$ERR_LOG"    # reset for the next run
+if [ "$BAD_LINES" -ne 0 ]; then
+  echo "!! test-graph tool emitted non-test output — affected set is not trustworthy" >&2
+  exit 1
+fi
 
 UT=()
 IT=()

@@ -132,13 +132,22 @@ else
   fi
 fi
 
-# 2) Fail fast if the test run produced no per-test .exec files (e.g. maven
-#    never executed the tests): an empty partial would silently dilute the
-#    aggregated baseline. Skipped for test-less modules (NO_TESTS=1).
-if [[ "${NO_TESTS:-0}" -eq 0 && "$SKIP_TESTS" -eq 0 ]]; then
-  n_exec="$(find "$PER_TEST" -maxdepth 1 -name '*.exec' 2>/dev/null | wc -l | tr -d ' ')"
+# 2) Fail fast if the invocation should have produced per-test .exec files but
+#    produced none: an empty partial would silently dilute the aggregated
+#    baseline, and a --skip-tests delta would be a no-op identity aggregate that
+#    still advances built-from.txt (the original false-green). Skipped only for
+#    test-less modules (NO_TESTS=1).
+if [[ "${NO_TESTS:-0}" -eq 0 ]]; then
+  n_exec=0
+  if [[ -d "$PER_TEST" ]]; then
+    n_exec="$(find "$PER_TEST" -maxdepth 1 -name '*.exec' | wc -l | tr -d ' ')"
+  fi
   if [[ "$n_exec" -eq 0 ]]; then
-    echo "phase-module: ERROR: no per-test .exec files produced under $PER_TEST (mvn test/verify failed?)" >&2
+    if [[ "$SKIP_TESTS" -eq 1 ]]; then
+      echo "phase-module: ERROR: --skip-tests delta build found no .exec files under $PER_TEST" >&2
+    else
+      echo "phase-module: ERROR: no per-test .exec files produced under $PER_TEST (mvn test/verify failed?)" >&2
+    fi
     exit 1
   fi
 fi

@@ -80,8 +80,15 @@ jobs:
           # the pom — hardcoding it made the OFFLINE `mvn -o` runs die with
           # "Plugin org.jacoco:jacoco-maven-plugin:<pin> could not be resolved"
           # as soon as an older feature branch got merged onto newer main.
-          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/{n;p;}' pom.xml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          [ -n "$JV" ] || JV="0.8.14"
+          # Resolve the jacoco plugin version from the reactor pom (literal or
+          # ${property}); a structural pom change must not silently fall back.
+          JV="$(sed -n '/<artifactId>jacoco-maven-plugin<\/artifactId>/,+8p' pom.xml | grep -oE '<version>[^<]+</version>' | head -1 | sed -E 's#</?version>##g')"
+          if [[ "$JV" == *'${'* ]]; then
+            JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
+            JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
+          fi
+          [[ "$JV" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || JV="0.8.14"
+          echo "jacoco version: $JV"
           for artifact in \
             "org.jacoco:org.jacoco.core:$JV" \
             "org.jacoco:jacoco-maven-plugin:$JV" \
@@ -197,8 +204,12 @@ jobs:
           # so unrelated modules are neither compiled nor (with -am) re-built.
           MODS="$(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt \
                   | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | sort -u | paste -sd, -)"
-          [ -z "$MODS" ] && MODS="dspace-api"
-          echo "affected modules: $MODS"
+          # No hardcoded module fallback: when the touched paths do not resolve
+          # to real modules, run across the reactor instead (the -Dtest/-Dit.test
+          # filters still restrict execution to the computed affected set).
+          PL_ARGS=()
+          if [ -n "$MODS" ]; then PL_ARGS=(-pl "$MODS"); echo "affected modules: $MODS"
+          else echo "affected modules: (none resolved) -> running across the reactor"; fi
           UT="${{ steps.affected.outputs.ut }}"
           IT="${{ steps.affected.outputs.it }}"
           # Do NOT pass -am here. With -am, dspace-parent is rebuilt inside this
@@ -216,12 +227,12 @@ jobs:
             # A non-zero exit here FAILS the run. Test failures or a broken test
             # environment must surface loudly — a green run that silently lost all
             # per-test coverage was the original false-green bug of this workflow.
-            $MVN -pl "$MODS" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+            $MVN "${PL_ARGS[@]}" -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
               -DfailIfNoTests=false test "-Dtest=$UT" \
               || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
           fi
           if [ -n "$IT" ]; then
-            $MVN -pl "$MODS" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+            $MVN "${PL_ARGS[@]}" -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
               -DfailIfNoTests=false verify "-Dit.test=$IT" \
               || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
           fi
@@ -230,17 +241,26 @@ jobs:
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           mkdir -p target/test-graph/deltas
-          for mod in $(grep -E '^dspace[a-z0-9-]*$' target/test-graph/affected/modules.txt | sort -u); do
+          total=0
+          # Scan every dspace* module dir: with a reactor-wide run (PL_ARGS empty)
+          # the .exec files can live in any module, not just those in modules.txt.
+          for dir in $(ls -d dspace*/ 2>/dev/null); do
+            mod="${dir%/}"
             [ -f "$mod/pom.xml" ] || continue
             [ -d "$mod/target/per-test" ] || continue
             n=$(find "$mod/target/per-test" -name '*.exec' | wc -l)
-            [ "$n" -gt 0 ] || { echo "no coverage for $mod"; continue; }
+            [ "$n" -gt 0 ] || continue
+            total=$((total + n))
             echo "delta partial for $mod ($n execs)"
             # --skip-tests: static + config + build from the .exec files already
             # produced above (no test re-run, per-test dir is preserved).
             bash tools/test-graph/phase-module.sh "$mod" --skip-tests \
               --db-out "target/test-graph/deltas/delta-$mod.sqlite"
           done
+          if [ "$total" -eq 0 ]; then
+            echo "!! affected tests were computed but NO per-test .exec coverage was produced (dead jacoco agent?) — refusing to advance the baseline" >&2
+            exit 1
+          fi
 
       - name: Merge deltas into baseline
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
@@ -256,7 +276,7 @@ jobs:
 
       - name: Validate patched index
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
-        run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite || true
+        run: bash tools/test-graph/run.sh validate --db target/test-graph/root-index.sqlite
 
       - name: Keep prior baseline when nothing was affected
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip == '1'
