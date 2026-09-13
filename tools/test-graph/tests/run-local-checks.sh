@@ -225,12 +225,26 @@ s4() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# S10 — merge-patch must not skip (and advance built-from) for a non-doc change
+# ---------------------------------------------------------------------------
+s10() {
+  local y="$ROOT/.github/workflows/merge-patch.yml" n
+  n="$(grep -c 'echo "skip=1"' "$y" 2>/dev/null || true)"
+  if grep -q 'FALLBACK_MODULES' "$y" && grep -q 'INERT_RE' "$y" && [ "$n" -eq 1 ]; then
+    pass "S10 merge-patch skip is gated by an inert check + module fallback"
+  else
+    fail "S10 merge-patch fallback missing (skip emissions=$n)"
+  fi
+}
+
 f3
 f5
 f6
 s2s8
 s5
 s4
+s10
 
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"

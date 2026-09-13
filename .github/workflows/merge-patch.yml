@@ -210,13 +210,34 @@ jobs:
             BLAST=1
             echo "Blast-radius change (pom/config/workflows/tools) -> running the FULL reactor (no skip)."
           fi
+          # S10: the index can return an empty set for a genuinely-not-indexed
+          # change (a new FQCN absent from the baseline, or a non-modeled file
+          # type such as .sql/.js/.csv). Only a docs-only diff may skip; any other
+          # unclassified change must run tests, or the baseline would advance
+          # with zero tests executed.
+          FALLBACK_MODULES=""
           if [ "$BLAST" -eq 0 ] && [ -z "$UT" ] && [ -z "$IT" ]; then
-            echo "Nothing affected since ${{ steps.baseline.outputs.base_sha }} — baseline is already current."
-            echo "skip=1" >> "$GITHUB_OUTPUT"
+            INERT_RE='\.md$|\.adoc$|^LICENSE$|^NOTICE$'
+            NONINERT=$(printf '%s\n' "$CHANGED" | grep -v '^[[:space:]]*$' | grep -vE "$INERT_RE" || true)
+            if [ -z "$NONINERT" ]; then
+              echo "Nothing affected since ${{ steps.baseline.outputs.base_sha }} (docs-only) — baseline is already current."
+              echo "skip=1" >> "$GITHUB_OUTPUT"
+            else
+              FALLBACK_MODULES=$(printf '%s\n' "$CHANGED" | cut -d/ -f1 | grep '^dspace' | sort -u \
+                | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, -)
+              if [ -z "$FALLBACK_MODULES" ]; then
+                # Unclassified non-doc change with no known module -> full reactor.
+                BLAST=1
+                echo "Unclassified non-doc change with no known module -> FULL reactor (no skip)."
+              else
+                echo "Index found nothing but modules changed -> full suites of: $FALLBACK_MODULES"
+              fi
+            fi
           fi
           echo "blast=$BLAST" >> "$GITHUB_OUTPUT"
           echo "ut=$UT" >> "$GITHUB_OUTPUT"
           echo "it=$IT" >> "$GITHUB_OUTPUT"
+          echo "modules=$FALLBACK_MODULES" >> "$GITHUB_OUTPUT"
 
       - name: Run affected tests with per-test coverage
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
@@ -231,6 +252,7 @@ jobs:
           UT="${{ steps.affected.outputs.ut }}"
           IT="${{ steps.affected.outputs.it }}"
           BLAST="${{ steps.affected.outputs.blast }}"
+          MODULES="${{ steps.affected.outputs.modules }}"
           # Do NOT pass -am here. With -am, dspace-parent is rebuilt inside this
           # reactor, which re-assembles testEnvironment.zip WITHOUT the
           # org.dspace:dspace module (never built by a -am reactor) — that zip is
@@ -264,6 +286,16 @@ jobs:
               $MVN -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
                 -DfailIfNoTests=false verify "-Dit.test=$IT" \
                 || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
+            fi
+            if [ -n "$MODULES" ] && [ -z "$UT" ] && [ -z "$IT" ]; then
+              # S10 fallback: the index found nothing for a non-doc change, so run
+              # the full suites of the touched modules (reactor artifacts are in m2
+              # from the install step, hence no -am). A non-zero exit FAILS the run;
+              # the baseline must not advance on a failed/empty test run.
+              echo "Module fallback -> full suites (UT + IT) of: $MODULES"
+              $MVN -Ptest-class-graph -pl "$MODULES" -DskipUnitTests=false -DskipIntegrationTests=false \
+                -DfailIfNoTests=false verify \
+                || { echo "!! module-fallback tests FAILED (see surefire/failsafe summaries above)"; exit 1; }
             fi
           fi
 

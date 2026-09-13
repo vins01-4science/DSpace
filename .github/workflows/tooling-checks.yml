@@ -1,0 +1,48 @@
+# Tooling checks — fast, network-free guard for the test-impact pipeline itself.
+#
+# Runs the local harness (tools/test-graph/tests/run-local-checks.sh) plus shell
+# syntax and workflow-YAML parsing. Without this job the round-3/round-4
+# regression tests were never executed in CI, so a change could silently break
+# the gate's own logic (S11). No Maven, no network: finishes in seconds.
+name: Tooling checks
+
+on:
+  pull_request:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/**'
+  push:
+    branches: [main, task/test-class-graph-phase0]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  local-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell syntax
+        run: bash -n tools/test-graph/*.sh tools/test-graph/tests/*.sh
+
+      - name: Workflow YAML parses
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob('.github/workflows/*.yml')):
+              try:
+                  yaml.safe_load(open(f))
+                  print("ok", f)
+              except Exception as e:
+                  print("FAIL", f, e); bad = 1
+          sys.exit(bad)
+          PY
+
+      - name: Pipeline unit checks
+        run: bash tools/test-graph/tests/run-local-checks.sh
