@@ -824,6 +824,13 @@ public class TestGraph {
             try (var stream = Files.walk(perTest)) {
                 execs = stream.filter(f -> f.toString().endsWith(".exec")).sorted().toList();
             }
+            // LIMITATION (round-3 H4): the per-test key is the raw exec filename,
+            // and nested classes are folded onto their top-level class above. A
+            // renamed/removed test therefore leaves a stale key that `impacted`
+            // can still name, and `$`-suffixed nested classes share coverage with
+            // their outer class. Stale classes are only caught when the affected
+            // list is non-empty (the zero-report backstop in the workflows); the
+            // fix is deferred, documented here.
             for (Path exec : execs) {
                 if (Files.size(exec) == 0) continue;
                 String key = exec.getFileName().toString();

@@ -105,7 +105,7 @@ jobs:
       - name: Fetch test-graph runtime deps (if not cached)
         run: |
           M2="$HOME/.m2/repository"
-          # Jacobo plugin version must follow pom.xml pluginManagement (0.8.14 on
+          # JaCoCo plugin version must follow pom.xml pluginManagement (0.8.14 on
           # older branches, 0.8.15 on newer upstream) — see merge-patch.yml.
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.

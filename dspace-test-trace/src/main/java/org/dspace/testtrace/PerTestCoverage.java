@@ -104,6 +104,15 @@ public class PerTestCoverage implements TestExecutionListener {
     }
 
     private void write(byte[] data, TestIdentifier testIdentifier) throws Exception {
+        // LIMITATION (round-3 H3): the exec file is keyed by the sanitized
+        // `Class.method`:
+        //   - repeated invocations of one method (parameterized/retries) overwrite
+        //     the same file, so the last invocation wins;
+        //   - @Nested tests collapse to `Outer_Inner` (the '.' is sanitized to
+        //     '_'), a name `-Dtest` cannot select;
+        //   - two method names differing only in sanitized characters collide.
+        // The class-level coverage union stays conservative (over-selects, never
+        // under-selects); per-invocation keys are a future fix, documented here.
         String className = "unknown";
         String methodName = "test";
         TestSource source = testIdentifier.getSource().orElse(null);
