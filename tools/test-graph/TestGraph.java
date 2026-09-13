@@ -286,13 +286,25 @@ public class TestGraph {
                 public MethodVisitor visitMethod(int access, String name, String descriptor,
                                                  String signature, String[] exceptions) {
                     return new MethodVisitor(Opcodes.ASM9) {
+                        private final java.util.Map<Integer, String> locals = new java.util.HashMap<>();
                         private String lastString;
                         private String lastType;
+                        private String concatPrefix = "";
+                        private boolean sbOpen = false;
+                        private String sbPrefix = "";
+
+                        private void clearFlow() {
+                            locals.clear();
+                            sbOpen = false;
+                            sbPrefix = "";
+                            concatPrefix = "";
+                        }
 
                         @Override
                         public void visitLdcInsn(Object cst) {
                             if (cst instanceof String) {
                                 lastString = (String) cst;
+                                if (sbOpen) sbPrefix += lastString;
                             } else if (cst instanceof Type) {
                                 Type t = (Type) cst;
                                 if (t.getSort() == Type.ARRAY) t = t.getElementType();
@@ -301,17 +313,71 @@ public class TestGraph {
                         }
 
                         @Override
+                        public void visitVarInsn(int opcode, int var) {
+                            if (opcode == Opcodes.ALOAD && locals.containsKey(var)) {
+                                lastString = locals.get(var);
+                                if (sbOpen) sbPrefix += lastString;
+                            } else if (opcode == Opcodes.ASTORE) {
+                                if (lastString != null) locals.put(var, lastString);
+                                else locals.remove(var);
+                            }
+                        }
+
+                        @Override
+                        public void visitTypeInsn(int opcode, String type) {
+                            if (opcode == Opcodes.NEW && "java/lang/StringBuilder".equals(type)) {
+                                sbOpen = true;
+                                sbPrefix = "";
+                            }
+                        }
+
+                        @Override
+                        public void visitInvokeDynamicInsn(String name, String descriptor,
+                                                           org.objectweb.asm.Handle bsm, Object... bsmArgs) {
+                            lastString = null;
+                            if (bsm != null
+                                    && "java/lang/invoke/StringConcatFactory".equals(bsm.getOwner())
+                                    && bsmArgs.length > 0 && bsmArgs[0] instanceof String) {
+                                String recipe = (String) bsmArgs[0];
+                                int cut = recipe.indexOf('\u0001');
+                                String head = cut < 0 ? recipe : recipe.substring(0, cut);
+                                if (!head.isEmpty()) concatPrefix = head;
+                            }
+                        }
+
+                        @Override
+                        public void visitLabel(org.objectweb.asm.Label label) {
+                            clearFlow();
+                        }
+
+                        @Override
+                        public void visitJumpInsn(int opcode, org.objectweb.asm.Label label) {
+                            clearFlow();
+                        }
+
+                        @Override
                         public void visitMethodInsn(int opcode, String callOwner, String callName,
                                                     String callDesc, boolean isInterface) {
+                            if ("java/lang/StringBuilder".equals(callOwner) && "append".equals(callName)
+                                    && lastString != null) {
+                                sbPrefix += lastString;
+                            } else if ("java/lang/StringBuilder".equals(callOwner)
+                                    && "toString".equals(callName)) {
+                                concatPrefix = sbPrefix;
+                                sbOpen = false;
+                                sbPrefix = "";
+                            } else if ("java/lang/String".equals(callOwner)
+                                    && "concat".equals(callName) && lastString != null) {
+                                concatPrefix = lastString;
+                            }
+
                             String kind = null;
                             String target = "";
                             if (callOwner.equals("java/lang/Class") && callName.equals("forName")) {
                                 kind = "forName";
-                                target = normTarget(lastString);
                             } else if (callOwner.startsWith("java/lang/ClassLoader")
                                     && callName.equals("loadClass")) {
                                 kind = "loadClass";
-                                target = normTarget(lastString);
                             } else if (callOwner.equals("java/util/ServiceLoader")
                                     && (callName.equals("load") || callName.equals("loadInstalled"))) {
                                 kind = "serviceLoader";
@@ -323,7 +389,22 @@ public class TestGraph {
                                     || callOwner.startsWith("java/lang/invoke/")) {
                                 kind = "reflect";
                             }
-                            if (kind != null) sites.add(new String[]{owner, kind, target});
+                            if (kind != null) {
+                                if (target.isEmpty()
+                                        && (kind.equals("forName") || kind.equals("loadClass"))) {
+                                    target = normTarget(lastString);
+                                    if (target.isEmpty()) {
+                                        String border = borderPrefix(lastString, concatPrefix);
+                                        if (!border.isEmpty()) {
+                                            kind = kind + "Prefix";
+                                            target = border;
+                                        }
+                                    }
+                                }
+                                sites.add(new String[]{owner, kind, target});
+                                concatPrefix = "";
+                            }
+                            lastString = null;
                         }
                     };
                 }
@@ -344,6 +425,22 @@ public class TestGraph {
     }
 
     /**
+     * Phase 2 (string/border analysis): a class name built as
+     * "literal-prefix" + dynamic-part yields a namespace border. Any changed class
+     * under that border could be the reflected target, so it must fail closed.
+     */
+    private static final Pattern RE_BORDER =
+            Pattern.compile("^[A-Za-z_$][\\w$]*(\\.[\\w$]+)+\\.$");
+
+    private static String borderPrefix(String literal, String concat) {
+        String[] candidates = {concat, literal};
+        for (String s : candidates) {
+            if (s != null && RE_BORDER.matcher(s).matches()) return s;
+        }
+        return "";
+    }
+
+    /**
      * Reflection resolution used by affected.sh. Phase 0 failed closed for ANY
      * changed reflection hub or target; Phase 1 resolves the statically-known
      * edges instead and only fails closed when the target cannot be known.
@@ -353,8 +450,10 @@ public class TestGraph {
      *                    changed constant Class.forName/loadClass target (reverse
      *                    edge), so its tests exercise the dynamically-loaded class.
      *   dynamic &lt;FQCN&gt;  a changed class owns a non-constant / reflective /
-     *                    ServiceLoader call site whose target cannot be resolved, so
-     *                    the caller must force the full reactor.
+     *                    ServiceLoader call site whose target cannot be resolved, or
+     *                    falls under a Phase-2 border (a package prefix of a
+     *                    dynamically-built class name), so the caller must force the
+     *                    full reactor.
      * Exit 3 = the index predates the reflection model (stale): force everything.
      */
     private static void reflectionResolveCmd(Map<String, String> opts) throws Exception {
@@ -372,6 +471,8 @@ public class TestGraph {
             // Owners with at least one site whose target cannot be known statically
             // (non-constant target, ServiceLoader providers, Class.newInstance, reflect).
             Set<String> dynamicOwners = new HashSet<>();
+            // Phase 2 borders: package prefixes of dynamically-built class names.
+            Set<String> borders = new TreeSet<>();
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT owner, kind, target FROM reflection_sites");
                  ResultSet rs = ps.executeQuery()) {
@@ -386,6 +487,9 @@ public class TestGraph {
                         targetOwners.computeIfAbsent(target, k -> new TreeSet<>()).add(owner);
                     } else {
                         dynamicOwners.add(owner);
+                        if (kind.endsWith("Prefix") && !target.isEmpty()) {
+                            borders.add(target);
+                        }
                     }
                 }
             }
@@ -398,7 +502,18 @@ public class TestGraph {
                     line = line.trim();
                     if (line.isEmpty()) continue;
                     String cls = topLevel(line);
-                    if (dynamicOwners.contains(cls)) dynamic.add(cls);
+                    if (dynamicOwners.contains(cls)) {
+                        dynamic.add(cls);
+                        continue;
+                    }
+                    boolean inBorder = false;
+                    for (String p : borders) {
+                        if (cls.startsWith(p)) { inBorder = true; break; }
+                    }
+                    if (inBorder) {
+                        dynamic.add(cls);
+                        continue;
+                    }
                     Set<String> owners = targetOwners.get(cls);
                     if (owners != null) resolve.addAll(owners);
                 }

@@ -274,6 +274,18 @@ r0( ) {
 }
 r0
 
+r1() {
+  local tg="$TG/TestGraph.java" ok=1
+  # Phase 2 string/border analysis: constant-folded concat + package borders.
+  for pat in 'RE_BORDER' 'borderPrefix' 'StringConcatFactory' 'visitInvokeDynamicInsn' \
+             '"Prefix"' 'borders.add' 'cls.startsWith(p)' ; do
+    grep -qF -- "$pat" "$tg" || { echo "  R1 TestGraph missing: $pat"; ok=0; }
+  done
+  if [ "$ok" -eq 1 ]; then pass "R1 string/border analysis wired (concat prefix -> fail closed)"
+  else fail "R1 string/border analysis wiring"; fi
+}
+r1
+
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"
 else
