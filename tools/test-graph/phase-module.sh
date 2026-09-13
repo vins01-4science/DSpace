@@ -161,6 +161,11 @@ if [[ ! -s "$MODULE/target/test-graph/edges.tsv" ]]; then
   echo "phase-module: ERROR: static produced an empty edges.tsv for $MODULE (no compiled classes?)" >&2
   exit 1
 fi
+# Reflection sites (ASM phase 0): read from the compiled classes so `build` can
+# populate the index's reflection_sites table. An index WITHOUT that table makes
+# `reflection-check` exit 3 (fail closed -> full reactor), so this must run for
+# both the full baseline and every merge-patch delta. An empty result is fine.
+"$TG" reflection --module "$MODULE"
 "$TG" config  --module "$MODULE" $ROOT_ARG
 
 # 4) Build the partial index from only this invocation's per-test .exec files.

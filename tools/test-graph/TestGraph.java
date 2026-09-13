@@ -5,9 +5,11 @@
  *
  * http://www.dspace.org/license/
  */
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -232,6 +234,161 @@ public class TestGraph {
         if (t == null) return;
         if (t.getSort() == Type.ARRAY) t = t.getElementType();
         if (t.getSort() == Type.OBJECT) refs.add(new Ref(t.getInternalName(), "uses"));
+    }
+
+    // ------------------------------------------------------------- reflection
+
+    /**
+     * Reflection sites are the static graph's structural blind spot: a class loaded
+     * via {@code Class.forName}/{@code ServiceLoader}/{@code ClassLoader.loadClass}
+     * or instantiated through {@code java.lang.reflect} has no compile-time edge, so
+     * a change to it would otherwise be invisible to the index. Phase 0 does not try
+     * to resolve dynamic targets; it records the call site so {@code affected.sh} can
+     * fail closed (run the full reactor) whenever a changed class is a reflection hub
+     * or a named reflection target. Over-approximation only ever runs more tests.
+     */
+    private static void reflectionCmd(Map<String, String> opts) throws IOException {
+        Path module = Paths.get(require(opts, "module"));
+        Path classes = module.resolve("target/classes");
+        Path testClasses = module.resolve("target/test-classes");
+        Path out = Paths.get(opts.getOrDefault("out",
+                module.resolve("target/test-graph/reflection_sites.tsv").toString()));
+        Files.createDirectories(out.getParent());
+
+        Set<String> rows = new TreeSet<>();
+        collectReflection(classes, rows);
+        collectReflection(testClasses, rows);
+
+        StringBuilder sb = new StringBuilder();
+        for (String r : rows) sb.append(r).append('\n');
+        Files.writeString(out, sb.toString());
+        System.out.println("reflection: " + rows.size() + " sites -> " + out);
+    }
+
+    private static void collectReflection(Path root, Set<String> rows) throws IOException {
+        if (!Files.exists(root)) return;
+        try (var stream = Files.walk(root)) {
+            for (Path p : stream.filter(f -> f.toString().endsWith(".class")).toList()) {
+                for (String[] r : reflectionSitesOf(Files.readAllBytes(p))) {
+                    rows.add(r[0] + "\t" + r[1] + "\t" + r[2]);
+                }
+            }
+        }
+    }
+
+    private static List<String[]> reflectionSitesOf(byte[] bytes) {
+        List<String[]> sites = new ArrayList<>();
+        try {
+            ClassReader cr = new ClassReader(bytes);
+            final String owner = topLevel(cr.getClassName().replace('/', '.'));
+            cr.accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                                 String signature, String[] exceptions) {
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        private String lastString;
+                        private String lastType;
+
+                        @Override
+                        public void visitLdcInsn(Object cst) {
+                            if (cst instanceof String) {
+                                lastString = (String) cst;
+                            } else if (cst instanceof Type) {
+                                Type t = (Type) cst;
+                                if (t.getSort() == Type.ARRAY) t = t.getElementType();
+                                if (t.getSort() == Type.OBJECT) lastType = t.getClassName();
+                            }
+                        }
+
+                        @Override
+                        public void visitMethodInsn(int opcode, String callOwner, String callName,
+                                                    String callDesc, boolean isInterface) {
+                            String kind = null;
+                            String target = "";
+                            if (callOwner.equals("java/lang/Class") && callName.equals("forName")) {
+                                kind = "forName";
+                                target = normTarget(lastString);
+                            } else if (callOwner.startsWith("java/lang/ClassLoader")
+                                    && callName.equals("loadClass")) {
+                                kind = "loadClass";
+                                target = normTarget(lastString);
+                            } else if (callOwner.equals("java/util/ServiceLoader")
+                                    && (callName.equals("load") || callName.equals("loadInstalled"))) {
+                                kind = "serviceLoader";
+                                target = normTarget(lastType);
+                            } else if (callOwner.equals("java/lang/Class")
+                                    && callName.equals("newInstance")) {
+                                kind = "newInstance";
+                            } else if (callOwner.startsWith("java/lang/reflect/")
+                                    || callOwner.startsWith("java/lang/invoke/")) {
+                                kind = "reflect";
+                            }
+                            if (kind != null) sites.add(new String[]{owner, kind, target});
+                        }
+                    };
+                }
+            }, 0);
+        } catch (Exception ignored) {
+            // skip unreadable class files
+        }
+        return sites;
+    }
+
+    /** Only a literal that already looks like a fully-qualified class name is usable. */
+    private static final Pattern RE_FQCN =
+            Pattern.compile("^[A-Za-z_$][\\w$]*(\\.[\\w$]+)+$");
+
+    private static String normTarget(String s) {
+        if (s == null) return "";
+        return RE_FQCN.matcher(s).matches() ? topLevel(s) : "";
+    }
+
+    /**
+     * Fail-closed check used by affected.sh: reads changed FQCNs (one per line) on
+     * stdin and prints any that are a reflection call-site owner or a named
+     * reflection target. Exit 0 = nothing to force; exit 3 = the index predates the
+     * reflection model (stale), which the caller must also treat as "run everything".
+     */
+    private static void reflectionCheckCmd(Map<String, String> opts) throws Exception {
+        Path db = Paths.get(require(opts, "db"));
+        Class.forName("org.sqlite.JDBC");
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
+            if (!hasTable(c, "reflection_sites")) {
+                System.err.println("reflection-check: index has no reflection_sites table "
+                        + "(predates the reflection model) -> forcing full reactor");
+                System.exit(3);
+            }
+            Map<String, Set<String>> owners = new HashMap<>();
+            Set<String> targets = new HashSet<>();
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT owner, kind, target FROM reflection_sites");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    owners.computeIfAbsent(rs.getString(1), k -> new TreeSet<>())
+                            .add(rs.getString(2));
+                    String t = rs.getString(3);
+                    if (t != null && !t.isEmpty()) targets.add(t);
+                }
+            }
+            Set<String> hits = new TreeSet<>();
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    String cls = topLevel(line);
+                    if (owners.containsKey(cls)) {
+                        hits.add(cls + " (reflection site: "
+                                + String.join(",", owners.get(cls)) + ")");
+                    } else if (targets.contains(cls)) {
+                        hits.add(cls + " (reflection target)");
+                    }
+                }
+            }
+            for (String h : hits) System.out.println(h);
+            // Non-empty stdout -> affected.sh writes a force_full marker.
+        }
     }
 
     // ----------------------------------------------------------------- config
@@ -910,6 +1067,7 @@ public class TestGraph {
         List<String[]> configKeys = readTsv(configDir.resolve("config_keys.tsv"));
         List<String[]> beanDecls = readTsv(configDir.resolve("bean_decls.tsv"));
         List<String[]> configConsumers = readTsv(configDir.resolve("config_consumers.tsv"));
+        List<String[]> reflectionSites = readTsv(configDir.resolve("reflection_sites.tsv"));
 
         // known class universe for folding bean edges
         Set<String> known = new HashSet<>();
@@ -988,7 +1146,7 @@ public class TestGraph {
             String[] drops = {"class_refs", "test_covers", "impact",
                     "cov_test", "cov_class", "cov_data",
                     "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
-                    "config_consumers"};
+                    "config_consumers", "reflection_sites", "meta"};
             for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
             c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
             c.createStatement().execute("CREATE TABLE cov_test(id INTEGER PRIMARY KEY, name TEXT)");
@@ -1000,7 +1158,17 @@ public class TestGraph {
             c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
             c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
             c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
-            try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
+            // Reflection sites: the phase-0 fail-closed safety net. Only created
+            // when the reflection pass actually ran, so a baseline index that
+            // predates it is detectable by `reflection-check` (exit 3).
+            boolean anyReflection = !reflectionSites.isEmpty();
+            if (anyReflection) {
+                    c.createStatement().execute(
+                            "CREATE TABLE reflection_sites(owner TEXT, kind TEXT, target TEXT)");
+                    c.createStatement().execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)");
+                    c.createStatement().execute("INSERT INTO meta VALUES ('reflection_model','1')");
+                }
+                try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
                  PreparedStatement ps2 = c.prepareStatement("INSERT INTO cov_test VALUES (?,?)");
                  PreparedStatement ps3 = c.prepareStatement("INSERT INTO cov_class VALUES (?,?)");
                  PreparedStatement ps4 = c.prepareStatement("INSERT INTO cov_data VALUES (?,?)");
@@ -1061,6 +1229,18 @@ public class TestGraph {
                 ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch(); ps4.executeBatch();
                 ps5.executeBatch(); ps6.executeBatch(); ps7.executeBatch();
                 ps8.executeBatch(); ps9.executeBatch(); ps10.executeBatch();
+                if (anyReflection) {
+                    try (PreparedStatement ps11 = c.prepareStatement(
+                            "INSERT INTO reflection_sites VALUES (?,?,?)")) {
+                        for (String[] r : reflectionSites) {
+                            ps11.setString(1, r.length > 0 ? r[0] : "");
+                            ps11.setString(2, r.length > 1 ? r[1] : "");
+                            ps11.setString(3, r.length > 2 ? r[2] : "");
+                            ps11.addBatch();
+                        }
+                        ps11.executeBatch();
+                    }
+                }
             }
             c.commit();
         }
@@ -1692,6 +1872,8 @@ public class TestGraph {
         Set<List<String>> configKeys = new LinkedHashSet<>();
         Set<List<String>> beanDecls = new LinkedHashSet<>();
         Set<List<String>> configConsumers = new LinkedHashSet<>();
+        Set<List<String>> reflectionSites = new LinkedHashSet<>();
+        boolean anyReflection = false;
 
         Class.forName("org.sqlite.JDBC");
 
@@ -1714,6 +1896,11 @@ public class TestGraph {
                 for (String[] r : readDb(sc, "SELECT file, key FROM config_keys")) configKeys.add(Arrays.asList(r));
                 for (String[] r : readDb(sc, "SELECT file, bean_type, bean_id FROM bean_decls")) beanDecls.add(Arrays.asList(r));
                 for (String[] r : readDb(sc, "SELECT file, class FROM config_consumers")) configConsumers.add(Arrays.asList(r));
+                if (hasTable(sc, "reflection_sites")) {
+                    anyReflection = true;
+                    for (String[] r : readDb(sc, "SELECT owner, kind, target FROM reflection_sites"))
+                        reflectionSites.add(Arrays.asList(r));
+                }
                 Map<Integer, String> ln = new HashMap<>();
                 localNames.add(ln);
                 if (!hasTable(sc, "cov_data")) continue;
@@ -1756,7 +1943,7 @@ public class TestGraph {
                 c.setAutoCommit(false);
                 String[] drops = {"class_refs", "test_covers", "impact", "cov_test", "cov_class", "cov_data",
                         "property_refs", "bean_refs", "config_keys", "bean_decls", "property_impact",
-                        "config_consumers"};
+                        "config_consumers", "reflection_sites", "meta"};
                 for (String t : drops) c.createStatement().execute("DROP TABLE IF EXISTS " + t);
                 c.createStatement().execute("CREATE TABLE class_refs(from_c TEXT, to_c TEXT, kind TEXT)");
                 c.createStatement().execute("CREATE TABLE cov_test(id INTEGER PRIMARY KEY, name TEXT)");
@@ -1767,7 +1954,16 @@ public class TestGraph {
                 c.createStatement().execute("CREATE TABLE config_keys(file TEXT, key TEXT)");
                 c.createStatement().execute("CREATE TABLE bean_decls(file TEXT, bean_type TEXT, bean_id TEXT)");
                 c.createStatement().execute("CREATE TABLE property_impact(key TEXT, test TEXT)");
-                c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
+            c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
+            // Reflection sites: the phase-0 fail-closed safety net. Only created
+            // when the reflection pass actually ran, so a baseline index that
+            // predates it is detectable by `reflection-check` (exit 3).
+            if (anyReflection) {
+                c.createStatement().execute(
+                        "CREATE TABLE reflection_sites(owner TEXT, kind TEXT, target TEXT)");
+                c.createStatement().execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)");
+                c.createStatement().execute("INSERT INTO meta VALUES ('reflection_model','1')");
+            }
                 try (PreparedStatement ps1 = c.prepareStatement("INSERT INTO class_refs VALUES (?,?,?)");
                      PreparedStatement ps2 = c.prepareStatement("INSERT INTO cov_test VALUES (?,?)");
                      PreparedStatement ps3 = c.prepareStatement("INSERT INTO cov_class VALUES (?,?)");
@@ -1824,6 +2020,18 @@ public class TestGraph {
                     ps1.executeBatch(); ps2.executeBatch(); ps3.executeBatch(); ps4.executeBatch();
                     ps5.executeBatch(); ps6.executeBatch(); ps7.executeBatch();
                     ps8.executeBatch(); ps9.executeBatch(); ps10.executeBatch();
+                    if (anyReflection) {
+                        try (PreparedStatement ps11 = c.prepareStatement(
+                                "INSERT INTO reflection_sites VALUES (?,?,?)")) {
+                            for (List<String> r : reflectionSites) {
+                                ps11.setString(1, r.size() > 0 ? r.get(0) : "");
+                                ps11.setString(2, r.size() > 1 ? r.get(1) : "");
+                                ps11.setString(3, r.size() > 2 ? r.get(2) : "");
+                                ps11.addBatch();
+                            }
+                            ps11.executeBatch();
+                        }
+                    }
                 }
                 c.commit();
             }
@@ -2032,12 +2240,14 @@ public class TestGraph {
     private static void usage() {
         System.out.println("Usage: java TestGraph.java <cmd> [options]");
         System.out.println("  static      --module <dir> [--out edges.tsv]");
+        System.out.println("  reflection  --module <dir> [--out reflection_sites.tsv]");
         System.out.println("  config      --module <dir> [--out dir] [--root <repo>]");
         System.out.println("  build       --module <dir> [--per-test dir] [--edges file] [--config dir] [--db file]");
         System.out.println("  impacted    --db <file> (--file <src|fqcn> | --property <key> |");
         System.out.println("                          --configfile <path> | --bean <type|id> | --beanfile <path>)");
         System.out.println("  refine      --db <file> (--diff <file|-> | --base <ref> [--head <ref>]) [--classes <dir>]");
         System.out.println("  validate    --module <dir> [--per-test dir] [--db file]");
+        System.out.println("  reflection-check --db <file>   (reads changed FQCNs on stdin)");
         System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...]");
     }
 
@@ -2055,6 +2265,8 @@ public class TestGraph {
         Map<String, String> opts = parseArgs(args, 1);
         switch (args[0]) {
             case "static":   staticCmd(opts); break;
+            case "reflection": reflectionCmd(opts); break;
+            case "reflection-check": reflectionCheckCmd(opts); break;
             case "config":   configCmd(opts); break;
             case "build":    buildCmd(opts); break;
             case "refine":   refineCmd(opts); break;

@@ -210,6 +210,15 @@ jobs:
             BLAST=1
             echo "Blast-radius change (pom/config/workflows/tools) -> running the FULL reactor (no skip)."
           fi
+          # Reflection safety net (ASM phase 0): affected.sh leaves force_full when
+          # a changed class touches Class.forName / loadClass / ServiceLoader /
+          # reflection. Force the full reactor (no skip) so the baseline cannot
+          # advance untested.
+          if [ -f target/test-graph/affected/force_full ]; then
+            BLAST=1
+            echo "Reflection safety net -> running the FULL reactor (no skip)."
+            cat target/test-graph/affected/force_full
+          fi
           # S10: the index can return an empty set for a genuinely-not-indexed
           # change (a new FQCN absent from the baseline, or a non-modeled file
           # type such as .sql/.js/.csv). Only a docs-only diff may skip; any other

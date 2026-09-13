@@ -158,6 +158,13 @@ jobs:
             else
               echo "baseline_found=false"
             fi
+            # Reflection safety net marker (ASM phase 0): affected.sh leaves
+            # force_full when a changed class touches reflection.
+            if [ -f target/test-graph/affected/force_full ]; then
+              echo "force_full=true"
+            else
+              echo "force_full=false"
+            fi
           } >> "$GITHUB_OUTPUT"
 
       # ---- 4. run only the affected tests (with module-suite fallback) ----
@@ -166,6 +173,7 @@ jobs:
           UT_CSV="${{ steps.affected.outputs.ut_csv }}"
           IT_CSV="${{ steps.affected.outputs.it_csv }}"
           BASELINE_FOUND="${{ steps.affected.outputs.baseline_found }}"
+          FORCE_FULL="${{ steps.affected.outputs.force_full }}"
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
@@ -199,6 +207,14 @@ jobs:
               -DfailIfNoTests=false
           elif printf '%s\n' "$CHANGED" | grep -qE "$BLAST_RE"; then
             echo "High-blast-radius change (pom/config/tools/workflows/src/Dockerfile) -> running the FULL reactor suite (UT + IT)."
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
+              -DfailIfNoTests=false
+          elif [ "$FORCE_FULL" = "true" ]; then
+            # Reflection safety net (ASM phase 0): a changed class touches
+            # Class.forName / loadClass / ServiceLoader / reflection, which the
+            # static class graph cannot resolve — fail closed with the full suite.
+            echo "Reflection safety net -> running the FULL reactor suite (UT + IT)."
+            cat target/test-graph/affected/force_full 2>/dev/null || true
             mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
               -DfailIfNoTests=false
           elif [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then

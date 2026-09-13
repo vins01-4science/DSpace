@@ -14,6 +14,9 @@
 #       surface and does not match docs.
 #   S4  the per-named-class assertion fails when a selected class produced no
 #       report and passes when it did.
+#   R0  ASM phase-0 reflection safety net is wired end to end: TestGraph.java
+#       extracts reflection sites, affected.sh emits a force_full marker, and both
+#       workflows fail closed (full reactor) when the marker is present.
 #
 # Usage: tools/test-graph/tests/run-local-checks.sh
 set -uo pipefail
@@ -245,6 +248,28 @@ s2s8
 s5
 s4
 s10
+r0( ) {
+  local tg="$TG/TestGraph.java" af="$TG/affected.sh"
+  local m="$ROOT/.github/workflows/merge-patch.yml" t="$AFFECTED_YML" ok=1
+  # TestGraph: detectors + the two new subcommands + index table plumbing.
+  for pat in 'reflection-check' 'reflection_sites' 'java/util/ServiceLoader' \
+             'java/lang/ClassLoader' 'java/lang/reflect/' 'java/lang/Class' 'forName' ; do
+    grep -qF -- "$pat" "$tg" || { echo "  R0 TestGraph missing: $pat"; ok=0; }
+  done
+  # affected.sh: collects changed classes and writes the marker.
+  grep -qF 'CHANGED_CLASSES' "$af" || { echo "  R0 affected.sh missing CHANGED_CLASSES"; ok=0; }
+  grep -qF 'force_full' "$af"        || { echo "  R0 affected.sh missing force_full"; ok=0; }
+  grep -qF 'reflection-check' "$af"  || { echo "  R0 affected.sh missing reflection-check call"; ok=0; }
+  # both workflows consume the marker.
+  grep -qF 'force_full' "$t" || { echo "  R0 test-affected.yml missing force_full"; ok=0; }
+  grep -qF 'force_full' "$m" || { echo "  R0 merge-patch.yml missing force_full"; ok=0; }
+  # the index build must emit reflection_sites, or every run fails closed to full.
+  grep -qE '"\$TG" reflection --module' "$TG/phase-module.sh" \
+    || { echo "  R0 phase-module.sh does not emit reflection_sites"; ok=0; }
+  if [ "$ok" -eq 1 ]; then pass "R0 reflection safety net wired (extract -> marker -> workflows)"
+  else fail "R0 reflection safety net wiring"; fi
+}
+r0
 
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"

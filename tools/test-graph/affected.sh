@@ -82,6 +82,10 @@ declare -A ALL=()
 # of a bare FQCN reduced `...NewFeatureTest` to its package and the new test
 # never ran). A file may also appear in ALL via the lookup; sort -u dedupes.
 declare -A TESTFILE=()
+# Every changed/added Java class (main or test), used only for the reflection
+# safety net below (ASM phase 0): a changed class that is a reflection hub — or a
+# name passed to Class.forName / loadClass / ServiceLoader — must fail closed.
+declare -a CHANGED_CLASSES=()
 ERR_LOG="$OUT_DIR/impacted.err"
 : > "$ERR_LOG"
 
@@ -106,6 +110,7 @@ add_line() { # accept only class / class.method tokens; anything else = tool mis
 for f in "${FILES[@]:-}"; do
   [[ -z "$f" ]] && continue
   if is_java_src "$f"; then
+    CHANGED_CLASSES+=("$(class_from_file "$f")")
     if is_test_file "$f"; then
       TESTFILE["$(class_from_file "$f")"]=1   # bare FQCN, no method
     fi
@@ -141,6 +146,33 @@ fi
 if [ "$BAD_LINES" -ne 0 ]; then
   echo "!! test-graph tool emitted non-test output — affected set is not trustworthy" >&2
   exit 1
+fi
+
+# Reflection safety net (ASM phase 0). Static class references cannot see
+# Class.forName / ClassLoader.loadClass / ServiceLoader / reflection. If any
+# changed class is a reflection hub (or is named as a reflection target), leave a
+# `force_full` marker so the workflow runs the full reactor. Fail closed: an index
+# built before reflection_sites existed (exit 3) also forces the full reactor.
+# Uses a SEPARATE stderr file so the rc=3 diagnostic does not trip the ERR_LOG guard.
+rm -f "$OUT_DIR/force_full"
+if [ -f "$DB" ] && [ "${#CHANGED_CLASSES[@]}" -gt 0 ]; then
+  REF_ERR="$OUT_DIR/reflection.err"; : > "$REF_ERR"
+  REF_RC=0
+  printf '%s\n' "${CHANGED_CLASSES[@]}" \
+    | "$TG" reflection-check --db "$DB" >"$OUT_DIR/reflection_hits.txt" 2>"$REF_ERR" || REF_RC=$?
+  if [ "$REF_RC" -eq 3 ]; then
+    echo "reflection safety net: baseline index predates reflection_sites -> forcing full reactor" > "$OUT_DIR/force_full"
+  elif [ "$REF_RC" -ne 0 ]; then
+    echo "!! reflection-check failed (rc=$REF_RC):" >&2
+    sed -n '1,10p' "$REF_ERR" >&2
+    exit 1
+  elif [ -s "$OUT_DIR/reflection_hits.txt" ]; then
+    {
+      echo "reflection safety net: changed class is a reflection hub/target"
+      cat "$OUT_DIR/reflection_hits.txt"
+    } > "$OUT_DIR/force_full"
+  fi
+  rm -f "$OUT_DIR/reflection_hits.txt" "$REF_ERR"
 fi
 
 UT=()
