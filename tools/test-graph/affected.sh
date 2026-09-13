@@ -137,6 +137,56 @@ for f in "${FILES[@]:-}"; do
   fi
 done
 
+# Reflection resolution (ASM phase 0/1). Static class references cannot see
+# Class.forName / ClassLoader.loadClass / ServiceLoader / reflection. Phase 1
+# resolves the statically-known edges instead of blanket-failing-closed:
+#   - a changed class that names a constant forName/loadClass target is a call-site
+#     owner, and we run the owners' tests for a changed constant target (reverse edge);
+#   - a changed class owning a non-constant / ServiceLoader / newInstance / reflect
+#     site is genuinely unresolvable, so it leaves a `force_full` marker.
+# An index built before reflection_sites existed (exit 3) also forces the full
+# reactor. Uses a SEPARATE stderr file so the rc=3 diagnostic does not trip ERR_LOG.
+rm -f "$OUT_DIR/force_full"
+if [ -f "$DB" ] && [ "${#CHANGED_CLASSES[@]}" -gt 0 ]; then
+  REF_ERR="$OUT_DIR/reflection.err"; : > "$REF_ERR"
+  REF_RC=0
+  printf '%s\n' "${CHANGED_CLASSES[@]}" \
+    | "$TG" reflection-resolve --db "$DB" >"$OUT_DIR/reflection_plan.txt" 2>"$REF_ERR" || REF_RC=$?
+  if [ "$REF_RC" -eq 3 ]; then
+    echo "reflection safety net: baseline index predates reflection_sites -> forcing full reactor" > "$OUT_DIR/force_full"
+  elif [ "$REF_RC" -ne 0 ]; then
+    echo "!! reflection-resolve failed (rc=$REF_RC):" >&2
+    sed -n '1,10p' "$REF_ERR" >&2
+    exit 1
+  elif grep -q $'^dynamic\t' "$OUT_DIR/reflection_plan.txt" 2>/dev/null; then
+    {
+      echo "reflection safety net: changed class owns an unresolvable reflection site"
+      grep $'^dynamic\t' "$OUT_DIR/reflection_plan.txt"
+    } > "$OUT_DIR/force_full"
+  else
+    # Resolved reverse edges: run the tests of the callers that name the changed target.
+    while IFS=$'\t' read -r verb cls; do
+      [ "$verb" = "resolve" ] || continue
+      [ -n "$cls" ] || continue
+      while IFS= read -r t; do add_line "$t"; done \
+        < <(impacted_for impacted --csv --db "$DB" --file "$cls")
+    done < "$OUT_DIR/reflection_plan.txt"
+  fi
+  rm -f "$OUT_DIR/reflection_plan.txt" "$REF_ERR"
+fi
+
+# Spring name-keyed lookups: a changed class may be resolved only through a string
+# bean id (getBean("...")) that the static graph cannot see. `impacted --bean
+# <FQCN>` resolves id -> declared bean_type from bean_decls, selecting those tests
+# even when no class references it by type. Conservative: only ever adds tests.
+if [ -f "$DB" ]; then
+  for cls in "${CHANGED_CLASSES[@]:-}"; do
+    [ -n "$cls" ] || continue
+    while IFS= read -r t; do add_line "$t"; done \
+      < <(impacted_for impacted --csv --db "$DB" --bean "$cls")
+  done
+fi
+
 if [ -s "$ERR_LOG" ]; then
   echo "!! test-graph tool emitted errors during impacted lookup (starting with):" >&2
   sed -n '1,10p' "$ERR_LOG" >&2
@@ -146,33 +196,6 @@ fi
 if [ "$BAD_LINES" -ne 0 ]; then
   echo "!! test-graph tool emitted non-test output — affected set is not trustworthy" >&2
   exit 1
-fi
-
-# Reflection safety net (ASM phase 0). Static class references cannot see
-# Class.forName / ClassLoader.loadClass / ServiceLoader / reflection. If any
-# changed class is a reflection hub (or is named as a reflection target), leave a
-# `force_full` marker so the workflow runs the full reactor. Fail closed: an index
-# built before reflection_sites existed (exit 3) also forces the full reactor.
-# Uses a SEPARATE stderr file so the rc=3 diagnostic does not trip the ERR_LOG guard.
-rm -f "$OUT_DIR/force_full"
-if [ -f "$DB" ] && [ "${#CHANGED_CLASSES[@]}" -gt 0 ]; then
-  REF_ERR="$OUT_DIR/reflection.err"; : > "$REF_ERR"
-  REF_RC=0
-  printf '%s\n' "${CHANGED_CLASSES[@]}" \
-    | "$TG" reflection-check --db "$DB" >"$OUT_DIR/reflection_hits.txt" 2>"$REF_ERR" || REF_RC=$?
-  if [ "$REF_RC" -eq 3 ]; then
-    echo "reflection safety net: baseline index predates reflection_sites -> forcing full reactor" > "$OUT_DIR/force_full"
-  elif [ "$REF_RC" -ne 0 ]; then
-    echo "!! reflection-check failed (rc=$REF_RC):" >&2
-    sed -n '1,10p' "$REF_ERR" >&2
-    exit 1
-  elif [ -s "$OUT_DIR/reflection_hits.txt" ]; then
-    {
-      echo "reflection safety net: changed class is a reflection hub/target"
-      cat "$OUT_DIR/reflection_hits.txt"
-    } > "$OUT_DIR/force_full"
-  fi
-  rm -f "$OUT_DIR/reflection_hits.txt" "$REF_ERR"
 fi
 
 UT=()

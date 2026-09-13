@@ -251,15 +251,18 @@ s10
 r0( ) {
   local tg="$TG/TestGraph.java" af="$TG/affected.sh"
   local m="$ROOT/.github/workflows/merge-patch.yml" t="$AFFECTED_YML" ok=1
-  # TestGraph: detectors + the two new subcommands + index table plumbing.
-  for pat in 'reflection-check' 'reflection_sites' 'java/util/ServiceLoader' \
-             'java/lang/ClassLoader' 'java/lang/reflect/' 'java/lang/Class' 'forName' ; do
+  # TestGraph: detectors + the resolve subcommand + index table plumbing.
+  for pat in 'reflectionResolveCmd' 'reflection-resolve' 'reflection_sites' \
+             'java/util/ServiceLoader' 'java/lang/ClassLoader' 'java/lang/reflect/' \
+             'java/lang/Class' 'forName' 'dynamic' ; do
     grep -qF -- "$pat" "$tg" || { echo "  R0 TestGraph missing: $pat"; ok=0; }
   done
-  # affected.sh: collects changed classes and writes the marker.
-  grep -qF 'CHANGED_CLASSES' "$af" || { echo "  R0 affected.sh missing CHANGED_CLASSES"; ok=0; }
+  # affected.sh: collects changed classes, resolves targets, writes the marker.
+  grep -qF 'CHANGED_CLASSES' "$af"   || { echo "  R0 affected.sh missing CHANGED_CLASSES"; ok=0; }
   grep -qF 'force_full' "$af"        || { echo "  R0 affected.sh missing force_full"; ok=0; }
-  grep -qF 'reflection-check' "$af"  || { echo "  R0 affected.sh missing reflection-check call"; ok=0; }
+  grep -qF 'reflection-resolve' "$af" || { echo "  R0 affected.sh missing reflection-resolve call"; ok=0; }
+  grep -qF 'reflection_plan.txt' "$af" || { echo "  R0 affected.sh missing resolve plan"; ok=0; }
+  grep -qF -- '--bean' "$af"          || { echo "  R0 affected.sh missing Spring bean lookup"; ok=0; }
   # both workflows consume the marker.
   grep -qF 'force_full' "$t" || { echo "  R0 test-affected.yml missing force_full"; ok=0; }
   grep -qF 'force_full' "$m" || { echo "  R0 merge-patch.yml missing force_full"; ok=0; }

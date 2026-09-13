@@ -344,33 +344,53 @@ public class TestGraph {
     }
 
     /**
-     * Fail-closed check used by affected.sh: reads changed FQCNs (one per line) on
-     * stdin and prints any that are a reflection call-site owner or a named
-     * reflection target. Exit 0 = nothing to force; exit 3 = the index predates the
-     * reflection model (stale), which the caller must also treat as "run everything".
+     * Reflection resolution used by affected.sh. Phase 0 failed closed for ANY
+     * changed reflection hub or target; Phase 1 resolves the statically-known
+     * edges instead and only fails closed when the target cannot be known.
+     *
+     * Reads changed FQCNs (one per line) on stdin and prints a plan:
+     *   resolve &lt;FQCN&gt;  run this class's tests: it is a caller that names a
+     *                    changed constant Class.forName/loadClass target (reverse
+     *                    edge), so its tests exercise the dynamically-loaded class.
+     *   dynamic &lt;FQCN&gt;  a changed class owns a non-constant / reflective /
+     *                    ServiceLoader call site whose target cannot be resolved, so
+     *                    the caller must force the full reactor.
+     * Exit 3 = the index predates the reflection model (stale): force everything.
      */
-    private static void reflectionCheckCmd(Map<String, String> opts) throws Exception {
+    private static void reflectionResolveCmd(Map<String, String> opts) throws Exception {
         Path db = Paths.get(require(opts, "db"));
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db)) {
             if (!hasTable(c, "reflection_sites")) {
-                System.err.println("reflection-check: index has no reflection_sites table "
+                System.err.println("reflection-resolve: index has no reflection_sites table "
                         + "(predates the reflection model) -> forcing full reactor");
                 System.exit(3);
             }
-            Map<String, Set<String>> owners = new HashMap<>();
-            Set<String> targets = new HashSet<>();
+            // Constant, resolvable reverse edges: target -> call-site owners that name
+            // it with a literal Class.forName / ClassLoader.loadClass target.
+            Map<String, Set<String>> targetOwners = new HashMap<>();
+            // Owners with at least one site whose target cannot be known statically
+            // (non-constant target, ServiceLoader providers, Class.newInstance, reflect).
+            Set<String> dynamicOwners = new HashSet<>();
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT owner, kind, target FROM reflection_sites");
                  ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    owners.computeIfAbsent(rs.getString(1), k -> new TreeSet<>())
-                            .add(rs.getString(2));
-                    String t = rs.getString(3);
-                    if (t != null && !t.isEmpty()) targets.add(t);
+                    String owner = topLevel(rs.getString(1));
+                    String kind = rs.getString(2);
+                    String raw = rs.getString(3);
+                    String target = raw == null ? "" : topLevel(raw);
+                    boolean constant = ("forName".equals(kind) || "loadClass".equals(kind))
+                            && !target.isEmpty();
+                    if (constant) {
+                        targetOwners.computeIfAbsent(target, k -> new TreeSet<>()).add(owner);
+                    } else {
+                        dynamicOwners.add(owner);
+                    }
                 }
             }
-            Set<String> hits = new TreeSet<>();
+            Set<String> resolve = new TreeSet<>();
+            Set<String> dynamic = new TreeSet<>();
             try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
                 String line;
@@ -378,16 +398,14 @@ public class TestGraph {
                     line = line.trim();
                     if (line.isEmpty()) continue;
                     String cls = topLevel(line);
-                    if (owners.containsKey(cls)) {
-                        hits.add(cls + " (reflection site: "
-                                + String.join(",", owners.get(cls)) + ")");
-                    } else if (targets.contains(cls)) {
-                        hits.add(cls + " (reflection target)");
-                    }
+                    if (dynamicOwners.contains(cls)) dynamic.add(cls);
+                    Set<String> owners = targetOwners.get(cls);
+                    if (owners != null) resolve.addAll(owners);
                 }
             }
-            for (String h : hits) System.out.println(h);
-            // Non-empty stdout -> affected.sh writes a force_full marker.
+            for (String d : dynamic) System.out.println("dynamic\t" + d);
+            for (String r : resolve) System.out.println("resolve\t" + r);
+            // No output = fully resolved or no reflection involvement; exit 0.
         }
     }
 
@@ -1160,7 +1178,7 @@ public class TestGraph {
             c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
             // Reflection sites: the phase-0 fail-closed safety net. Only created
             // when the reflection pass actually ran, so a baseline index that
-            // predates it is detectable by `reflection-check` (exit 3).
+            // predates it is detectable by `reflection-resolve` (exit 3).
             boolean anyReflection = !reflectionSites.isEmpty();
             if (anyReflection) {
                     c.createStatement().execute(
@@ -1957,7 +1975,7 @@ public class TestGraph {
             c.createStatement().execute("CREATE TABLE config_consumers(file TEXT, class TEXT)");
             // Reflection sites: the phase-0 fail-closed safety net. Only created
             // when the reflection pass actually ran, so a baseline index that
-            // predates it is detectable by `reflection-check` (exit 3).
+            // predates it is detectable by `reflection-resolve` (exit 3).
             if (anyReflection) {
                 c.createStatement().execute(
                         "CREATE TABLE reflection_sites(owner TEXT, kind TEXT, target TEXT)");
@@ -2247,7 +2265,7 @@ public class TestGraph {
         System.out.println("                          --configfile <path> | --bean <type|id> | --beanfile <path>)");
         System.out.println("  refine      --db <file> (--diff <file|-> | --base <ref> [--head <ref>]) [--classes <dir>]");
         System.out.println("  validate    --module <dir> [--per-test dir] [--db file]");
-        System.out.println("  reflection-check --db <file>   (reads changed FQCNs on stdin)");
+        System.out.println("  reflection-resolve --db <file>   (reads changed FQCNs on stdin)");
         System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...]");
     }
 
@@ -2266,7 +2284,7 @@ public class TestGraph {
         switch (args[0]) {
             case "static":   staticCmd(opts); break;
             case "reflection": reflectionCmd(opts); break;
-            case "reflection-check": reflectionCheckCmd(opts); break;
+            case "reflection-resolve": reflectionResolveCmd(opts); break;
             case "config":   configCmd(opts); break;
             case "build":    buildCmd(opts); break;
             case "refine":   refineCmd(opts); break;
