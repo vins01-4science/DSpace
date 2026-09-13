@@ -32,3 +32,5 @@ CP="$CP:$SQLITE"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 exec java --class-path "$CP" "$DIR/TestGraph.java" "$@"
+
+# PROBE E1: tools-only change must select the full reactor (F1)
