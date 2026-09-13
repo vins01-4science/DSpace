@@ -249,3 +249,5 @@ jobs:
           name: affected-tests
           path: target/test-graph/affected
           retention-days: 14
+
+# PROBE E5: self-editing pipeline PR must not pass vacuously (F1/F2)

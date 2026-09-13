@@ -1,0 +1,11 @@
+{
+    "schema_version": 1,
+    "commit": "c1696a8640d7684c8e4793952a957ae7acc32d9e",
+    "indexed_at": "2026-09-13T09:04:03Z",
+    "project": "home-vins-dev-projects-DSpace7-dspace-tcg-phase0",
+    "nodes": 77977,
+    "edges": 384999,
+    "original_size": 325713920,
+    "compressed_size": 40025743,
+    "compression_level": 3
+}

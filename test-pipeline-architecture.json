@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "GitHub Actions: test-impact acceleration",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/4Science/DSpace",
+      "revision": "7ccd51e6c5feb3e0305509996dc68951c96c48fb"
+    },
+    "viewBox": [1380, 820],
+    "views": [
+      {
+        "id": "pr-fast-path",
+        "label": "PR fast path",
+        "focus": ["pull_request", "baseline", "selector", "maven_affected", "pr_result"],
+        "note": "A pull request reuses the newest baseline and executes only tests selected from the diff."
+      },
+      {
+        "id": "baseline-lifecycle",
+        "label": "Baseline lifecycle",
+        "focus": ["weekly_rebuild", "matrix", "assemble", "shards", "aggregate", "baseline"],
+        "note": "The index is rebuilt weekly in parallel and published as a reusable artifact."
+      },
+      {
+        "id": "incremental-patch",
+        "label": "Incremental patch",
+        "focus": ["merge_push", "selector", "delta", "aggregate", "baseline"],
+        "note": "Each merge updates the baseline with fresh coverage for only the affected tests."
+      }
+    ]
+  },
+  "components": [
+    { "id": "pull_request", "type": "external", "label": "Pull request", "sublabel": "PR diff", "tag": "test-affected.yml", "sources": [{ "path": ".github/workflows/test-affected.yml", "line": 1, "label": "PR gate" }], "pos": [44, 180], "size": [176, 76] },
+    { "id": "merge_push", "type": "external", "label": "Push to main", "sublabel": "merged commit", "tag": "merge-patch.yml", "sources": [{ "path": ".github/workflows/merge-patch.yml", "line": 1, "label": "patch trigger" }], "pos": [44, 520], "size": [176, 76] },
+    { "id": "weekly_rebuild", "type": "cloud", "label": "Weekly full rebuild", "sublabel": "Monday 03:00 UTC", "tag": "impact-index.yml", "sources": [{ "path": ".github/workflows/impact-index.yml", "line": 1, "label": "safety net" }], "pos": [44, 620], "size": [176, 76] },
+    { "id": "baseline", "type": "database", "label": "Impact-index artifact", "sublabel": "root-index.sqlite + built-from.txt", "tag": "90-day artifact", "sources": [{ "path": ".github/workflows/impact-index.yml", "line": 336, "label": "published baseline" }, { "path": ".github/workflows/test-affected.yml", "line": 43, "label": "downloaded baseline" }], "pos": [310, 340], "size": [208, 82] },
+    { "id": "selector", "type": "backend", "label": "TestGraph selector", "sublabel": "diff → UT/IT + modules", "tag": "affected.sh", "sources": [{ "path": ".github/workflows/test-affected.yml", "line": 78, "label": "selection" }, { "path": "tools/test-graph/affected.sh", "line": 1, "label": "impact lookup" }], "pos": [590, 180], "size": [208, 82] },
+    { "id": "maven_affected", "type": "backend", "label": "Targeted Maven tests", "sublabel": "-Dtest / -Dit.test; -pl modules", "tag": "offline where possible", "sources": [{ "path": ".github/workflows/test-affected.yml", "line": 99, "label": "selected tests" }, { "path": ".github/workflows/merge-patch.yml", "line": 176, "label": "affected modules" }], "pos": [870, 180], "size": [222, 82] },
+    { "id": "pr_result", "type": "messagebus", "label": "PR result", "sublabel": "status + artifact", "tag": "fast feedback", "sources": [{ "path": ".github/workflows/test-affected.yml", "line": 141, "label": "artifact" }], "pos": [1200, 180], "size": [160, 82] },
+    { "id": "matrix", "type": "cloud", "label": "Dynamic shard matrix", "sublabel": "module × shard; fail-fast=false", "tag": "21+ cells", "sources": [{ "path": ".github/workflows/impact-index.yml", "line": 32, "label": "shard plan" }], "pos": [310, 620], "size": [208, 82] },
+    { "id": "assemble", "type": "backend", "label": "One-time assemble", "sublabel": "warm Maven + test environment", "tag": "shared prerequisite", "sources": [{ "path": ".github/workflows/impact-index.yml", "line": 70, "label": "assemble once" }], "pos": [590, 620], "size": [208, 82] },
+    { "id": "shards", "type": "backend", "label": "Parallel test shards", "sublabel": "phase-module.sh + JaCoCo", "tag": "partial SQLite indexes", "sources": [{ "path": ".github/workflows/impact-index.yml", "line": 168, "label": "parallel build" }, { "path": "tools/test-graph/phase-module.sh", "line": 1, "label": "module phase" }], "pos": [870, 620], "size": [222, 82] },
+    { "id": "delta", "type": "backend", "label": "Coverage delta", "sublabel": "fresh per-test .exec", "tag": "merge-patch", "sources": [{ "path": ".github/workflows/merge-patch.yml", "line": 216, "label": "delta partials" }], "pos": [590, 520], "size": [208, 82] },
+    { "id": "aggregate", "type": "database", "label": "Aggregate index", "sublabel": "union baseline + deltas", "tag": "conservative mapping", "sources": [{ "path": ".github/workflows/impact-index.yml", "line": 327, "label": "full aggregate" }, { "path": ".github/workflows/merge-patch.yml", "line": 232, "label": "patch aggregate" }], "pos": [1200, 300], "size": [160, 82] }
+  ],
+  "connections": [
+    { "id": "pr-baseline", "from": "pull_request", "to": "baseline", "label": "download newest successful artifact", "variant": "emphasis", "route": "orthogonal-h" },
+    { "id": "baseline-selector", "from": "baseline", "to": "selector", "label": "root-index.sqlite", "route": "orthogonal-h" },
+    { "id": "pr-selector", "from": "pull_request", "to": "selector", "label": "PR diff", "variant": "dashed" },
+    { "id": "selector-maven", "from": "selector", "to": "maven_affected", "label": "UT/IT + modules", "variant": "emphasis", "labelDy": -35 },
+    { "id": "maven-result", "from": "maven_affected", "to": "pr_result", "label": "pass/fail", "labelDy": -35 },
+    { "id": "push-delta", "from": "merge_push", "to": "delta", "label": "patch diff + coverage", "variant": "dashed", "labelDy": -35 },
+    { "id": "delta-aggregate", "from": "delta", "to": "aggregate", "label": "delta SQLite", "route": "orthogonal-h", "labelDy": -35 },
+    { "id": "aggregate-baseline", "from": "aggregate", "to": "baseline", "label": "publish impact-index", "variant": "emphasis" },
+    { "id": "weekly-matrix", "from": "weekly_rebuild", "to": "matrix", "label": "full rebuild", "variant": "emphasis", "labelDy": -35 },
+    { "id": "matrix-assemble", "from": "matrix", "to": "assemble", "label": "plan jobs", "labelDy": -35 },
+    { "id": "assemble-shards", "from": "assemble", "to": "shards", "label": "warm cache + reactor", "variant": "emphasis", "labelDy": -35 },
+    { "id": "shards-aggregate", "from": "shards", "to": "aggregate", "label": "partial SQLite", "labelDy": -40 }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Why it is faster", "items": ["PRs reuse a baseline instead of rebuilding the repo-wide graph", "Only impacted unit/integration tests run; touched-module suites are the fallback", "A one-time assemble warms Maven before module/shard jobs run in parallel"] },
+    { "dot": "violet", "title": "How correctness is preserved", "items": ["Weekly full rebuild heals coverage drift", "Merge patches union fresh coverage with the previous baseline", "Maven compile outputs are cached while Surefire/Failsafe always execute"] }
+  ]
+}
