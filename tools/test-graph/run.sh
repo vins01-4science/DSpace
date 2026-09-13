@@ -7,6 +7,10 @@ M2="${M2:-$HOME/.m2/repository}"
 
 pick() { # glob prefix -> newest matching jar
   local dir="$1" pat="$2"
+  # A missing dir makes `find` exit non-zero; under `set -euo pipefail` that
+  # aborted the whole script before the friendly "missing a required jar" check
+  # below could run (F5). Returning empty hands control to that check.
+  [ -d "$dir" ] || return 0
   find "$dir" -name "$pat" ! -name '*-sources.jar' 2>/dev/null | sort -V | tail -1
 }
 
