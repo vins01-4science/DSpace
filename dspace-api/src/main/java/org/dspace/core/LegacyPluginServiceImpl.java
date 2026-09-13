@@ -68,6 +68,7 @@ import org.springframework.beans.factory.annotation.Autowired;
  * @author Tim Donohue (turned old PluginManager into a PluginService)
  * @see SelfNamedPlugin
  */
+// PROBE: reflection safety net — comment-only change to a Class.forName hub (must force full reactor)
 public class LegacyPluginServiceImpl implements PluginService {
     /**
      * log4j category
