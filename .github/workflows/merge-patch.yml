@@ -192,10 +192,26 @@ jobs:
             --out target/test-graph/affected
           UT="$(cat target/test-graph/affected/ut.csv)"
           IT="$(cat target/test-graph/affected/it.csv)"
-          if [ -z "$UT" ] && [ -z "$IT" ]; then
+          # Blast-radius: a dependency bump, shared-config change, or a change to
+          # the pipeline's own surface (workflows/tools) invalidates the index's
+          # notion of "affected". Never skip in that case, or the baseline would
+          # advance untested (F4: pom.xml-only push copied the old DB and moved
+          # built-from forward). Blast forces the full reactor in the run step.
+          CHANGED="$(git diff --name-only --diff-filter=ADMR \
+            "${{ steps.baseline.outputs.base_sha }}...${{ github.sha }}")" || {
+            echo "!! git diff ${{ steps.baseline.outputs.base_sha }}...${{ github.sha }} failed" >&2
+            exit 1; }
+          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^\.github/|^tools/'
+          BLAST=0
+          if printf '%s\n' "$CHANGED" | grep -qE "$BLAST_RE"; then
+            BLAST=1
+            echo "Blast-radius change (pom/config/workflows/tools) -> running the FULL reactor (no skip)."
+          fi
+          if [ "$BLAST" -eq 0 ] && [ -z "$UT" ] && [ -z "$IT" ]; then
             echo "Nothing affected since ${{ steps.baseline.outputs.base_sha }} — baseline is already current."
             echo "skip=1" >> "$GITHUB_OUTPUT"
           fi
+          echo "blast=$BLAST" >> "$GITHUB_OUTPUT"
           echo "ut=$UT" >> "$GITHUB_OUTPUT"
           echo "it=$IT" >> "$GITHUB_OUTPUT"
 
@@ -203,16 +219,15 @@ jobs:
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           cd "$GITHUB_WORKSPACE"
-          # Deliberately do NOT narrow with -pl. modules.txt maps changed FILES to
-          # modules and under-covers the affected set: dspace/config/* maps to the
-          # pom-only `dspace` module (which hosts no tests -> zero executed), and a
-          # test in one module can be impacted by a source change in another (e.g.
-          # Context.java in dspace-api impacts org.dspace.app.rest.* in
-          # dspace-server-webapp). Run reactor-wide; -Dtest/-Dit.test still bound
-          # execution to the computed set, and every module is already installed
-          # into the local repo, so this only recompiles incrementally.
+          # Run reactor-wide rather than narrowing with -pl: a test in one module
+          # can be impacted by a source change in another (e.g. Context.java in
+          # dspace-api impacts org.dspace.app.rest.* in dspace-server-webapp), so
+          # the affected set may name tests outside the modules of the changed
+          # files. -Dtest/-Dit.test still bound execution; every module is already
+          # installed into the local repo, so this only recompiles incrementally.
           UT="${{ steps.affected.outputs.ut }}"
           IT="${{ steps.affected.outputs.it }}"
+          BLAST="${{ steps.affected.outputs.blast }}"
           # Do NOT pass -am here. With -am, dspace-parent is rebuilt inside this
           # reactor, which re-assembles testEnvironment.zip WITHOUT the
           # org.dspace:dspace module (never built by a -am reactor) — that zip is
@@ -221,21 +236,32 @@ jobs:
           # determined". The install step above already put a complete zip (and
           # all modules) into the local repo, so the reactor resolves everything
           # from m2.
-          if [ -n "$UT" ]; then
-            # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
-            # and word-splitting must apply (a quoted "$MVN" would be one command).
-            #
-            # A non-zero exit here FAILS the run. Test failures or a broken test
-            # environment must surface loudly — a green run that silently lost all
-            # per-test coverage was the original false-green bug of this workflow.
-            $MVN -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
-              -DfailIfNoTests=false test "-Dtest=$UT" \
-              || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
-          fi
-          if [ -n "$IT" ]; then
-            $MVN -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
-              -DfailIfNoTests=false verify "-Dit.test=$IT" \
-              || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
+          if [ "$BLAST" = "1" ]; then
+            # Blast radius -> the index cannot bound the impact. Run the whole
+            # reactor (verify covers both surefire UT and failsafe IT). A non-zero
+            # exit FAILS the run: losing all per-test coverage was the original
+            # false-green bug of this workflow.
+            echo "Blast-radius change -> running the FULL reactor (UT + IT)."
+            $MVN -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=false \
+              -DfailIfNoTests=false verify \
+              || { echo "!! full-reactor tests FAILED (see surefire/failsafe summaries above)"; exit 1; }
+          else
+            if [ -n "$UT" ]; then
+              # $MVN unquoted on purpose: job env MVN="mvn -o -B" is a flag string,
+              # and word-splitting must apply (a quoted "$MVN" would be one command).
+              #
+              # A non-zero exit here FAILS the run. Test failures or a broken test
+              # environment must surface loudly — a green run that silently lost all
+              # per-test coverage was the original false-green bug of this workflow.
+              $MVN -Ptest-class-graph -DskipUnitTests=false -DskipIntegrationTests=true \
+                -DfailIfNoTests=false test "-Dtest=$UT" \
+                || { echo "!! affected unit tests FAILED (see surefire summary above)"; exit 1; }
+            fi
+            if [ -n "$IT" ]; then
+              $MVN -Ptest-class-graph -DskipUnitTests=true -DskipIntegrationTests=false \
+                -DfailIfNoTests=false verify "-Dit.test=$IT" \
+                || { echo "!! affected integration tests FAILED (see failsafe summary above)"; exit 1; }
+            fi
           fi
 
       - name: Build per-module delta partials
@@ -244,7 +270,7 @@ jobs:
           mkdir -p target/test-graph/deltas
           total=0
           # Scan every dspace* module dir: the test run is reactor-wide, so
-          # the .exec files can live in any module, not just those in modules.txt.
+          # the .exec files can live in any module.
           for dir in $(ls -d dspace*/ 2>/dev/null); do
             mod="${dir%/}"
             [ -f "$mod/pom.xml" ] || continue
