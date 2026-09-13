@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # affected.sh — given the baseline impact index and a git diff (base...head),
-# compute the tests that must be re-run, split into unit vs integration tests,
-# and the touched modules (for the fallback path).
+# compute the tests that must be re-run, split into unit vs integration tests.
 #
 # Output (written to --out <dir>, default target/test-graph/affected):
 #   ut.csv      comma-separated simple UT class names
 #   it.csv      comma-separated simple IT class names
-#   modules.txt newline-separated touched module dirs (first path component)
 #
 # Usage:
 #   tools/test-graph/affected.sh --db <index.sqlite> --base <sha> [--head <sha>] [--out <dir>]
@@ -65,7 +63,6 @@ is_test_file() { [[ "$1" == */src/test/java/*.java ]]; }
 is_cfg()       { [[ "$1" == *.cfg || "$1" == *.properties || "$1" == *.yml || "$1" == *.yaml ]]; }
 is_bean_xml()  { [[ "$1" == */spring/*.xml || "$1" == *-services.xml || "$1" == *-beans.xml ]]; }
 
-module_of()    { echo "$1" | cut -d/ -f1; }
 class_from_file() {
   local rel
   rel="$(echo "$1" | sed -E 's#.*/src/(main|test)/java/##; s#\.java$##')"
@@ -76,7 +73,12 @@ is_it_class() {
 }
 
 declare -A ALL=()
-declare -A MODS=()
+# Changed/added test files are tracked by their bare FQCN: the tool emits
+# `Class.method`, but a changed test's own class has no method attached, so it
+# must NOT go through the method-stripping below (F3: stripping the last segment
+# of a bare FQCN reduced `...NewFeatureTest` to its package and the new test
+# never ran). A file may also appear in ALL via the lookup; sort -u dedupes.
+declare -A TESTFILE=()
 ERR_LOG="$OUT_DIR/impacted.err"
 : > "$ERR_LOG"
 
@@ -100,10 +102,9 @@ add_line() { # accept only class / class.method tokens; anything else = tool mis
 
 for f in "${FILES[@]:-}"; do
   [[ -z "$f" ]] && continue
-  MODS["$(module_of "$f")"]=1
   if is_java_src "$f"; then
     if is_test_file "$f"; then
-      ALL["$(class_from_file "$f")"]=1   # a changed test must re-run itself
+      TESTFILE["$(class_from_file "$f")"]=1   # bare FQCN, no method
     fi
     while IFS= read -r t; do
       add_line "$t"
@@ -141,20 +142,20 @@ fi
 
 UT=()
 IT=()
-for t in "${!ALL[@]}"; do
-  cls="${t%.*}"            # drop the method name
-  simple="${cls##*.}"
+add_class() { # $1 = FQCN or Class.method; classify by simple class name
+  local simple="${1##*.}"
   if is_it_class "$simple"; then IT+=("$simple"); else UT+=("$simple"); fi
-done
+}
+# Tool output is Class.method -> drop the method. Changed test files are bare
+# FQCNs -> use as-is (the two are disjoint by construction; sort -u dedupes).
+for t in "${!ALL[@]}";      do add_class "${t%.*}"; done
+for c in "${!TESTFILE[@]}"; do add_class "$c";       done
 
 : > "$OUT_DIR/ut.csv"
 : > "$OUT_DIR/it.csv"
-: > "$OUT_DIR/modules.txt"
 if ((${#UT[@]}));  then printf '%s\n' "${UT[@]}"  | sort -u | paste -sd, - > "$OUT_DIR/ut.csv";  fi
 if ((${#IT[@]}));  then printf '%s\n' "${IT[@]}"  | sort -u | paste -sd, - > "$OUT_DIR/it.csv";  fi
-if ((${#MODS[@]})); then printf '%s\n' "${!MODS[@]}" | sort -u > "$OUT_DIR/modules.txt"; fi
 
-echo "affected: ${#ALL[@]} tests (UT=$(< "$OUT_DIR/ut.csv" tr ',' '\n' | grep -c .) IT=$(< "$OUT_DIR/it.csv" tr ',' '\n' | grep -c .)) across $(grep -c . "$OUT_DIR/modules.txt") modules"
+echo "affected: ${#ALL[@]} tests (UT=$(< "$OUT_DIR/ut.csv" tr ',' '\n' | grep -c .) IT=$(< "$OUT_DIR/it.csv" tr ',' '\n' | grep -c .))"
 echo "  UT_CSV : $(cat "$OUT_DIR/ut.csv")"
 echo "  IT_CSV : $(cat "$OUT_DIR/it.csv")"
-echo "  MODULES: $(paste -sd, - < "$OUT_DIR/modules.txt")"

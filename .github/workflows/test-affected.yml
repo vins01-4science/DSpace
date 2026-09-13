@@ -169,10 +169,25 @@ jobs:
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
+          # One source of truth: the PR diff, computed once. Hoist the blast-radius
+          # rule ABOVE the arms so it applies even when the index also found tests:
+          # a dependency bump (pom.xml) or shared-config change can invalidate the
+          # whole index, and a test that happens to be affected must not narrow the
+          # run. Broadening the regex to the pipeline's own surface (workflows +
+          # tools) also stops a self-editing PR from passing vacuously.
+          CHANGED="$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA")" || {
+            echo "!! git diff $BASE_SHA...$HEAD_SHA failed" >&2; exit 1; }
+
+          # High-blast-radius: dependencies, shared config, AND the pipeline itself.
+          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^\.github/|^tools/'
           if [ "$BASELINE_FOUND" = "false" ]; then
             # No baseline impact-index yet — we cannot compute what is affected,
             # so the honest gate is the FULL suite (the pre-impact-testing build).
             echo "No baseline impact-index found -> running the FULL suite (whole reactor, UT + IT)."
+            mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
+              -DfailIfNoTests=false
+          elif printf '%s\n' "$CHANGED" | grep -qE "$BLAST_RE"; then
+            echo "High-blast-radius change (pom.xml / dspace/config / .github / tools) -> running the FULL reactor suite (UT + IT)."
             mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
               -DfailIfNoTests=false
           elif [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then
@@ -188,34 +203,24 @@ jobs:
             mvn -B -V install -P-assembly -DskipIntegrationTests=false -DfailIfNoTests=false \
               -Dit.test="$IT_CSV" -DskipUnitTests=true
           else
-            # Baseline exists but nothing is affected by the diff:
-            #   - high-blast-radius change (any pom.xml / shared config tree) ->
-            #     everything may be affected: run the FULL reactor UT+IT.
+            # Not blast-radius and the index found nothing:
             #   - docs-only / new files              -> nothing to test
             #   - source changes missed by the index -> touched modules' suites.
-            CHANGED="$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA")" || {
-              echo "!! git diff $BASE_SHA...$HEAD_SHA failed" >&2; exit 1; }
-            if printf '%s\n' "$CHANGED" | grep -qE '(^|/)pom\.xml$|^dspace/config/'; then
-              echo "High-blast-radius change (pom.xml or dspace/config) -> running the FULL reactor suite (UT + IT)."
-              mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
-                -DfailIfNoTests=false
-            else
-              # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
-              # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
-              # determined" failure seen in merge-patch). Install the reactor first
-              # (this also materializes the complete zip in local m2), THEN test -pl.
-              MODULES=$(printf '%s\n' "$CHANGED" | cut -d/ -f1 | grep '^dspace' | sort -u \
-                        | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, -)
-              if [ -z "$MODULES" ]; then
-                echo "Nothing to test (no source/config changes)."
-                exit 0
-              fi
-              echo "Falling back to full suites (UT + IT) of modules: $MODULES"
-              mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
-                -DfailIfNoTests=false
-              mvn -B -V install -P-assembly -pl "$MODULES" \
-                -DskipUnitTests=false -DskipIntegrationTests=false -DfailIfNoTests=false
+            # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
+            # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
+            # determined" failure seen in merge-patch). Install the reactor first
+            # (this also materializes the complete zip in local m2), THEN test -pl.
+            MODULES=$(printf '%s\n' "$CHANGED" | cut -d/ -f1 | grep '^dspace' | sort -u \
+                      | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, -)
+            if [ -z "$MODULES" ]; then
+              echo "Nothing to test (no source/config/blast changes)."
+              exit 0
             fi
+            echo "Falling back to full suites (UT + IT) of modules: $MODULES"
+            mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
+              -DfailIfNoTests=false
+            mvn -B -V install -P-assembly -pl "$MODULES" \
+              -DskipUnitTests=false -DskipIntegrationTests=false -DfailIfNoTests=false
           fi
 
           # Backstop: the computed lists can name stale/renamed classes, and
