@@ -1,13 +1,13 @@
 package org.dspace.impact;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.Assert.assertTrue;
 
-import org.junit.jupiter.api.Test;
+import org.junit.Test;
 
-class GateProbeTest {
+public class GateProbeTest {
 
     @Test
-    void probe() {
+    public void probe() {
         assertTrue(true);
     }
 }
