@@ -40,6 +40,7 @@ import org.thymeleaf.templatemode.TemplateMode;
 @Import(BasicConfiguration.class)
 // Scan for controllers in this package
 @ComponentScan("org.dspace.xoai.controller")
+// PROBE phase-1: constant Class.forName target (OAIpmhIT) -- must RESOLVE, not force full reactor.
 public class OAIWebConfig implements WebMvcConfigurer {
 
     // Path where OAI is deployed. Defaults to "oai"
