@@ -52,7 +52,10 @@ MB="$(git merge-base "$BASE" "$HEAD" 2>/dev/null)" || {
 if [ "$MB" != "$BASE" ]; then
   echo "!! note: --base $BASE is not an ancestor of --head $HEAD (baseline tip moved); diffing from merge-base $MB" >&2
 fi
-if ! DIFF_LIST="$(git diff --name-only --diff-filter=ADMR "$BASE...$HEAD" 2>&1)"; then
+# --no-renames: a rename emits BOTH the deleted old path and the added new path,
+# so a guarded file moved out of its prefix stays visible. T: a typechange
+# (regular file -> symlink) is a real content change and must be listed.
+if ! DIFF_LIST="$(git diff --no-renames --name-only --diff-filter=ADMRT "$BASE...$HEAD" 2>&1)"; then
   echo "!! git diff $BASE...$HEAD failed: $DIFF_LIST" >&2
   exit 1
 fi

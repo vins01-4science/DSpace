@@ -197,11 +197,14 @@ jobs:
           # notion of "affected". Never skip in that case, or the baseline would
           # advance untested (F4: pom.xml-only push copied the old DB and moved
           # built-from forward). Blast forces the full reactor in the run step.
-          CHANGED="$(git diff --name-only --diff-filter=ADMR \
+          # --no-renames: a rename yields BOTH the old and new path; T: a
+          # typechange (file -> symlink) is a real change. Guards against hiding
+          # a guarded-path change (S2/S8).
+          CHANGED="$(git diff --no-renames --name-only --diff-filter=ADMRT \
             "${{ steps.baseline.outputs.base_sha }}...${{ github.sha }}")" || {
             echo "!! git diff ${{ steps.baseline.outputs.base_sha }}...${{ github.sha }} failed" >&2
             exit 1; }
-          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^\.github/|^tools/'
+          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^dspace-test-trace/|^src/|^\.github/|^\.mvn/|^tools/|(^|/)Dockerfile|(^|/)docker-compose|(^|/)checkstyle\.xml$'
           BLAST=0
           if printf '%s\n' "$CHANGED" | grep -qE "$BLAST_RE"; then
             BLAST=1

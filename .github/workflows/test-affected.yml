@@ -175,11 +175,22 @@ jobs:
           # whole index, and a test that happens to be affected must not narrow the
           # run. Broadening the regex to the pipeline's own surface (workflows +
           # tools) also stops a self-editing PR from passing vacuously.
-          CHANGED="$(git diff --name-only --diff-filter=ADMR "$BASE_SHA...$HEAD_SHA")" || {
+          # --no-renames: a rename yields BOTH the deleted old path and the added
+          # new path, so a guarded file moved out of its prefix stays visible.
+          # T: a typechange (e.g. a file replaced by a symlink) is a real change.
+          CHANGED="$(git diff --no-renames --name-only --diff-filter=ADMRT "$BASE_SHA...$HEAD_SHA")" || {
             echo "!! git diff $BASE_SHA...$HEAD_SHA failed" >&2; exit 1; }
 
-          # High-blast-radius: dependencies, shared config, AND the pipeline itself.
-          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^\.github/|^tools/'
+          # S3: never trust reports committed into the PR checkout. Remove any
+          # TEST-*.xml already present so the backstop below counts only reports
+          # THIS run produced (a `git add -f` of a fake report used to satisfy it).
+          find . -path '*/target/*-reports/TEST-*.xml' -delete 2>/dev/null || true
+
+          # High-blast-radius: dependencies, shared config, AND the pipeline's
+          # whole build/test surface (root assembly `src/`, the coverage listener,
+          # Docker/checkstyle config, workflows, tools). Anything here invalidates
+          # the index's notion of impact.
+          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^dspace-test-trace/|^src/|^\.github/|^\.mvn/|^tools/|(^|/)Dockerfile|(^|/)docker-compose|(^|/)checkstyle\.xml$'
           if [ "$BASELINE_FOUND" = "false" ]; then
             # No baseline impact-index yet — we cannot compute what is affected,
             # so the honest gate is the FULL suite (the pre-impact-testing build).
@@ -187,7 +198,7 @@ jobs:
             mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
               -DfailIfNoTests=false
           elif printf '%s\n' "$CHANGED" | grep -qE "$BLAST_RE"; then
-            echo "High-blast-radius change (pom.xml / dspace/config / .github / tools) -> running the FULL reactor suite (UT + IT)."
+            echo "High-blast-radius change (pom/config/tools/workflows/src/Dockerfile) -> running the FULL reactor suite (UT + IT)."
             mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
               -DfailIfNoTests=false
           elif [ -n "$UT_CSV" ] && [ -n "$IT_CSV" ]; then
@@ -204,7 +215,7 @@ jobs:
               -Dit.test="$IT_CSV" -DskipUnitTests=true
           else
             # Not blast-radius and the index found nothing:
-            #   - docs-only / new files              -> nothing to test
+            #   - docs-only                          -> genuinely nothing to test
             #   - source changes missed by the index -> touched modules' suites.
             # NOTE: no -am here — a -am reactor re-assembles testEnvironment.zip
             # WITHOUT org.dspace:dspace (the "DSpace home directory could not be
@@ -213,17 +224,29 @@ jobs:
             MODULES=$(printf '%s\n' "$CHANGED" | cut -d/ -f1 | grep '^dspace' | sort -u \
                       | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, -)
             if [ -z "$MODULES" ]; then
-              echo "Nothing to test (no source/config/blast changes)."
-              exit 0
+              # Only a docs-only change may exit green with zero tests. Any other
+              # unclassified file (e.g. a `.sql`/`.ftl` with no index entry) must
+              # not slip through: run the full suite rather than report success.
+              INERT_RE='\.md$|\.adoc$|^LICENSE$|^NOTICE$'
+              NONINERT=$(printf '%s\n' "$CHANGED" | grep -v '^[[:space:]]*$' | grep -vE "$INERT_RE" || true)
+              if [ -z "$NONINERT" ]; then
+                echo "Nothing to test (docs-only change)."
+                exit 0
+              fi
+              echo "Unclassified non-doc change with no known module -> running the FULL suite (safe fallback)."
+              mvn -B -V install -P-assembly -DskipUnitTests=false -DskipIntegrationTests=false \
+                -DfailIfNoTests=false
+            else
+              echo "Falling back to full suites (UT + IT) of modules: $MODULES"
+              mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
+                -DfailIfNoTests=false
+              mvn -B -V install -P-assembly -pl "$MODULES" \
+                -DskipUnitTests=false -DskipIntegrationTests=false -DfailIfNoTests=false
             fi
-            echo "Falling back to full suites (UT + IT) of modules: $MODULES"
-            mvn -B -V install -P-assembly -DskipUnitTests=true -DskipIntegrationTests=true \
-              -DfailIfNoTests=false
-            mvn -B -V install -P-assembly -pl "$MODULES" \
-              -DskipUnitTests=false -DskipIntegrationTests=false -DfailIfNoTests=false
           fi
 
-          # Backstop: the computed lists can name stale/renamed classes, and
+          # >>> S3: zero-report backstop
+          # The computed lists can name stale/renamed classes, and
           # -DfailIfNoTests=false would otherwise report green with zero tests.
           # (The "Nothing to test" arm above exits 0 before reaching this.)
           RAN=$(find . -path '*/target/*-reports/TEST-*.xml' -print 2>/dev/null | wc -l | tr -d ' ')
@@ -231,6 +254,27 @@ jobs:
             echo "!! tests were selected but NO surefire/failsafe reports were produced — stale affected classes?" >&2
             exit 1
           fi
+          # <<< S3: zero-report backstop
+
+          # >>> S4: per-named-class report assertion
+          # A global report count does not prove the SELECTED classes ran:
+          # -DfailIfNoSpecifiedTests=false makes a stale/renamed selected class a
+          # silent no-op, while a report from any other module satisfies the count.
+          # Assert every specifically-named affected class produced a TEST-<fqcn>.xml.
+          REPORTS=$(find . -path '*/target/*-reports/TEST-*.xml' -print 2>/dev/null \
+                    | sed 's#.*/TEST-##; s#\.xml$##')
+          MISSING=""
+          for name in $(printf '%s,%s' "$UT_CSV" "$IT_CSV" | tr ',' '\n' | grep -v '^[[:space:]]*$'); do
+            base="${name##*.}"
+            if ! printf '%s\n' "$REPORTS" | grep -qE "(^|[.]|[$])${base}$"; then
+              MISSING="$MISSING $name"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "!! affected classes produced NO report (stale/renamed/silent no-op):$MISSING" >&2
+            exit 1
+          fi
+          # <<< S4: per-named-class report assertion
 
       - name: Summarize
         if: always()
