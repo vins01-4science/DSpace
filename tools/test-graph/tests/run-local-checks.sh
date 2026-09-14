@@ -441,6 +441,29 @@ s7() {
 }
 s7
 
+s14() {
+  local wfdir="$ROOT/.github/workflows" ok=1 bad
+  # S14: every external action must be pinned to a full 40-hex commit SHA, with the
+  # human-readable tag kept in a trailing comment. Local reusable workflows (./...)
+  # are exempt (they live in this repo).
+  bad=$(grep -rhoE 'uses:[[:space:]]*[^[:space:]]+' "$wfdir"/*.yml \
+        | sed 's/^uses:[[:space:]]*//' \
+        | grep -vE '^\./' \
+        | grep -vE '@[0-9a-f]{40}$' || true)
+  if [ -n "$bad" ]; then
+    echo "  S14 unpinned external action(s):"
+    printf '%s\n' "$bad" | sed 's/^/    /'
+    ok=0
+  fi
+  # A pinned entry must keep the original tag as a comment for readability.
+  if ! grep -rqE 'uses: actions/checkout@[0-9a-f]{40} # v7' "$wfdir"/*.yml; then
+    echo "  S14 actions/checkout pin comment missing"; ok=0
+  fi
+  if [ "$ok" -eq 1 ]; then pass "S14 all external actions pinned by commit SHA"
+  else fail "S14 actions not pinned by SHA"; fi
+}
+s14
+
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"
 else

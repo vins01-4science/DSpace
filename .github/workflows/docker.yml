@@ -163,10 +163,10 @@ jobs:
     steps:
       # Checkout our codebase (to get access to Docker Compose scripts)
       - name: Checkout codebase
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Download Docker image artifacts (which were just built by reusable-docker-build.yml)
       - name: Download Docker image artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           # Download all amd64 Docker images (TAR files) into the /tmp/docker directory
           pattern: docker-image-*-linux-amd64

@@ -57,11 +57,11 @@ jobs:
     steps:
       # https://github.com/actions/checkout
       - name: Checkout codebase
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # https://github.com/actions/setup-java
       - name: Install JDK ${{ matrix.java }}
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           java-version: ${{ matrix.java }}
           distribution: 'temurin'
@@ -77,14 +77,14 @@ jobs:
       # (This artifact is downloadable at the bottom of any job's summary page)
       - name: Upload Results of ${{ matrix.type }} to Artifact
         if: ${{ failure() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.type }} results
           path: ${{ matrix.resultsdir }}
 
       # Upload code coverage report to artifact, so that it can be shared with the 'codecov' job (see below)
       - name: Upload code coverage report to Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.type }} coverage report
           path: 'dspace/target/site/jacoco-aggregate/jacoco.xml'
@@ -99,11 +99,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Download artifacts from previous 'tests' job
       - name: Download coverage artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       # Now attempt upload to Codecov using its action.
       # NOTE: We use a retry action to retry the Codecov upload if it fails the first time.
@@ -111,7 +111,7 @@ jobs:
       # Retry action: https://github.com/marketplace/actions/retry-action
       # Codecov action: https://github.com/codecov/codecov-action
       - name: Upload coverage to Codecov.io
-        uses: Wandalen/wretry.action@v3.8.0
+        uses: Wandalen/wretry.action@e68c23e6309f2871ca8ae4763e7629b9c258e1ea # v3.8.0
         with:
           action: codecov/codecov-action@v4
           # Ensure codecov-action throws an error when it fails to upload
