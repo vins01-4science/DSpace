@@ -82,7 +82,9 @@ jobs:
           # as soon as an older feature branch got merged onto newer main.
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
+          # Single source of truth for the resolver and the blast regex (G9).
+          . tools/test-graph/pipeline-lib.sh
+          JV="$(jacoco_version pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
@@ -204,7 +206,8 @@ jobs:
             "${{ steps.baseline.outputs.base_sha }}...${{ github.sha }}")" || {
             echo "!! git diff ${{ steps.baseline.outputs.base_sha }}...${{ github.sha }} failed" >&2
             exit 1; }
-          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^dspace-test-trace/|^src/|^\.github/|^\.mvn/|^tools/|(^|/)Dockerfile|(^|/)docker-compose|(^|/)checkstyle\.xml$'
+          # Blast-radius + inert definitions are shared with test-affected (G9).
+          . tools/test-graph/pipeline-lib.sh
           BLAST=0
           if printf '%s\n' "$CHANGED" | grep -qE "$BLAST_RE"; then
             BLAST=1
@@ -226,7 +229,6 @@ jobs:
           # with zero tests executed.
           FALLBACK_MODULES=""
           if [ "$BLAST" -eq 0 ] && [ -z "$UT" ] && [ -z "$IT" ]; then
-            INERT_RE='\.md$|\.adoc$|^LICENSE$|^NOTICE$'
             NONINERT=$(printf '%s\n' "$CHANGED" | grep -v '^[[:space:]]*$' | grep -vE "$INERT_RE" || true)
             if [ -z "$NONINERT" ]; then
               echo "Nothing affected since ${{ steps.baseline.outputs.base_sha }} (docs-only) — baseline is already current."

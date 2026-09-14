@@ -109,7 +109,9 @@ jobs:
           # older branches, 0.8.15 on newer upstream) — see merge-patch.yml.
           # Resolve the jacoco plugin version from the reactor pom (literal or
           # ${property}); a structural pom change must not silently fall back.
-          JV="$(awk 'BEGIN{RS="</plugin>"} /<artifactId>[[:space:]]*jacoco-maven-plugin[[:space:]]*<\/artifactId>/{ if (match($0,/<version>[^<]+<\/version>/)) { s=substr($0,RSTART,RLENGTH); gsub(/<\/?version>/,"",s); print s; exit } }' pom.xml)"
+          # Single source of truth for the resolver and the blast regex (G9).
+          . tools/test-graph/pipeline-lib.sh
+          JV="$(jacoco_version pom.xml)"
           if [[ "$JV" == *'${'* ]]; then
             JP="$(sed -E 's/.*\$\{([^}]+)\}.*/\1/' <<<"$JV")"
             JV="$(sed -nE "s#.*<$JP>([^<]+)</$JP>.*#\1#p" pom.xml | head -1)"
@@ -197,8 +199,8 @@ jobs:
           # High-blast-radius: dependencies, shared config, AND the pipeline's
           # whole build/test surface (root assembly `src/`, the coverage listener,
           # Docker/checkstyle config, workflows, tools). Anything here invalidates
-          # the index's notion of impact.
-          BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^dspace-test-trace/|^src/|^\.github/|^\.mvn/|^tools/|(^|/)Dockerfile|(^|/)docker-compose|(^|/)checkstyle\.xml$'
+          # the index's notion of impact. Definitions live in pipeline-lib.sh (G9).
+          . tools/test-graph/pipeline-lib.sh
           if [ "$BASELINE_FOUND" = "false" ]; then
             # No baseline impact-index yet — we cannot compute what is affected,
             # so the honest gate is the FULL suite (the pre-impact-testing build).
@@ -243,7 +245,6 @@ jobs:
               # Only a docs-only change may exit green with zero tests. Any other
               # unclassified file (e.g. a `.sql`/`.ftl` with no index entry) must
               # not slip through: run the full suite rather than report success.
-              INERT_RE='\.md$|\.adoc$|^LICENSE$|^NOTICE$'
               NONINERT=$(printf '%s\n' "$CHANGED" | grep -v '^[[:space:]]*$' | grep -vE "$INERT_RE" || true)
               if [ -z "$NONINERT" ]; then
                 echo "Nothing to test (docs-only change)."

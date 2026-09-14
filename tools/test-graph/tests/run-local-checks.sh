@@ -201,7 +201,9 @@ s2s8() {
 # ---------------------------------------------------------------------------
 s5() {
   local re p ok=1
-  re="$(grep -m1 '^[[:space:]]*BLAST_RE=' "$AFFECTED_YML" | sed -E "s/.*BLAST_RE='([^']*)'.*/\1/")"
+  # G9: single source of truth — extract the shared blast regex from the lib.
+  if [ ! -f "$TG/pipeline-lib.sh" ]; then fail "S5 pipeline-lib.sh missing"; return; fi
+  re="$(sed -n "s/^BLAST_RE='\(.*\)'$/\1/p" "$TG/pipeline-lib.sh" | head -1)"
   if [ -z "$re" ]; then fail "S5 could not extract BLAST_RE"; return; fi
   for p in src/main/assembly/testEnvironment.xml dspace-test-trace/pom.xml \
            Dockerfile docker-compose.yml checkstyle.xml \
@@ -290,6 +292,7 @@ with open(sys.argv[2], 'w') as fh:
     fh.write('set -euo pipefail\n' + body)
 PY
     mkdir -p "$d/repo/tools/test-graph"
+    cp "$TG/pipeline-lib.sh" "$d/repo/tools/test-graph/pipeline-lib.sh"
     cat > "$d/repo/tools/test-graph/affected.sh" <<'STUB'
 #!/usr/bin/env bash
 out=target/test-graph/affected
