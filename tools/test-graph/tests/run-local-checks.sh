@@ -709,11 +709,16 @@ s12
 s7() {
   local pc="$ROOT/dspace-test-trace/src/main/java/org/dspace/testtrace/PerTestCoverage.java" ok=1
   [ -f "$pc" ] || { fail "S7 PerTestCoverage.java not found"; return; }
-  # Unique per-invocation key: a per-JVM token + monotonic sequence appended to the
-  # sanitized stem, so parameterized tests / retries no longer overwrite one file.
-  for pat in 'AtomicLong' 'ProcessHandle' 'JVM' '"__"' 'Outer$Inner' '[^a-zA-Z0-9.$_-]' 'execFileName('; do
+  # Unique per-invocation key: a STABLE per-method invocation number appended to the
+  # sanitized stem, so parameterized tests / retries no longer overwrite one file,
+  # yet the key is identical across builds (no unbounded growth on merge).
+  for pat in 'AtomicInteger' 'INVOCATIONS' 'ConcurrentHashMap' '"__"' 'Outer$Inner' '[^a-zA-Z0-9.$_-]' 'execFileName('; do
     grep -qF -- "$pat" "$pc" || { echo "  S7 PerTestCoverage missing: $pat"; ok=0; }
   done
+  # The volatile pid/seq scheme (unstable keys) must be gone.
+  if grep -qF 'ProcessHandle' "$pc"; then
+    echo "  S7 still uses the volatile JVM-pid suffix"; ok=0
+  fi
   # The old truncating single-file key must be gone.
   if grep -qF 'safe + ".exec"' "$pc"; then
     echo "  S7 still uses the truncating single-file key"; ok=0
@@ -745,8 +750,11 @@ public class S7Probe {
         if (!a.contains("org.x.Outer$Inner.case1")) {
             System.err.println("dropped-': " + a); System.exit(2);
         }
-        if (!a.matches("org\\.x\\.Outer\\$Inner\\.case1__[0-9a-f]+_[0-9a-f]+")) {
+        if (!a.matches("org\\.x\\.Outer\\$Inner\\.case1__[0-9]+")) {
             System.err.println("bad-shape: " + a); System.exit(3);
+        }
+        if (!a.endsWith("__1") || !b.endsWith("__2")) {
+            System.err.println("unstable-counter: " + a + " / " + b); System.exit(4);
         }
         System.out.println(a);
         System.out.println(b);
