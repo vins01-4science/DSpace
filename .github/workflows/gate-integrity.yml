@@ -32,10 +32,23 @@ jobs:
           set -euo pipefail
           # Paths whose change would let a PR alter how its own verdict is computed.
           PROTECTED='^(\.github/|tools/|dspace-test-trace/)'
-          files="$(gh api --paginate \
-            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --jq '.[].filename')"
-          hits="$(printf '%s\n' "$files" | grep -E "$PROTECTED" || true)"
+          PR="repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}"
+          # G2: GitHub caps the files API at 3000 entries. If the PR reports more
+          # changed files than the API returned, the list is incomplete: fail closed
+          # rather than risk a protected change hiding past the cap.
+          changed="$(gh api "$PR" --jq '.changed_files')"
+          files_json="$(gh api --paginate "$PR/files?per_page=100" --jq '.[] | @json')"
+          nfiles="$(printf '%s\n' "$files_json" | grep -c . || true)"
+          if [ "$changed" -gt "$nfiles" ] || [ "$nfiles" -ge 3000 ]; then
+            echo "::error::Cannot fully enumerate this PR's changed files (reported $changed, API returned $nfiles; GitHub caps at 3000)."
+            echo "The gate refuses to certify a PR whose file list may hide a pipeline/gate change."
+            exit 1
+          fi
+          # G1: include BOTH sides of a rename. Moving a protected file out of
+          # .github/ or tools/ or dspace-test-trace/ leaves previous_filename set, so
+          # the guard still fires.
+          all_paths="$(printf '%s\n' "$files_json" | jq -r '.filename, (.previous_filename // empty)')"
+          hits="$(printf '%s\n' "$all_paths" | grep -E "$PROTECTED" || true)"
           if [ -n "$hits" ]; then
             echo "::error::This PR modifies the test pipeline / gate itself:"
             printf '%s\n' "$hits"

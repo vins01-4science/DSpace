@@ -146,9 +146,10 @@ done
 # replaces the per-file class-level `impacted --file` lookups: refine starts from the
 # same class-level impacted union and narrows it to the tests that actually cover the
 # changed lines (cov_data in the index). It degrades to the class-level union when
-# coverage is absent, and falls back to that union if line narrowing empties the set,
-# so it can never under-select relative to class-level impact. One call (not one per
-# file) also avoids re-reading the whole diff N times.
+# coverage is absent, and falls back to that union only when line narrowing empties the
+# set. It can still drop a class-level candidate if a non-empty narrowed subset omits a
+# test that a semantics-modifying change would break (G4); the union is the floor, not a
+# guarantee. One call (not one per file) also avoids re-reading the whole diff N times.
 if [ "$HAVE_JAVA" -eq 1 ]; then
   DIFF_PATCH="$OUT_DIR/diff.patch"
   git diff --no-renames --diff-filter=ADMRT "$BASE...$HEAD" > "$DIFF_PATCH"

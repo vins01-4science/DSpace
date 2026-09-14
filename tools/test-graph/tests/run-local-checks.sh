@@ -482,7 +482,74 @@ s1() {
     grep -qF '/tools/' "$co" || { echo "  S1 CODEOWNERS missing /tools/"; ok=0; }
     grep -qF '/dspace-test-trace/' "$co" || { echo "  S1 CODEOWNERS missing /dspace-test-trace/"; ok=0; }
   fi
-  if [ "$ok" -eq 1 ]; then pass "S1 immutable gate-integrity check + CODEOWNERS"
+
+  # S1 executable probe (G1/G2): extract the gate's OWN run-script from the workflow
+  # and execute it against a stubbed `gh`. It must fail on (a) a rename of a
+  # protected file OUT of its prefix (previous_filename) and (b) a file list that
+  # GitHub's 3000-entry cap truncated; it must pass on an inert PR. This replaces a
+  # pure grep tautology with behaviour the gate actually exhibits.
+  if [ -f "$wf" ]; then
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+      echo "  S1 executable probe skipped (python3/jq unavailable)"
+    else
+      local gd; gd="$(mktemp -d 2>/dev/null)" || gd=""
+      if [ -z "$gd" ]; then
+        echo "  S1 executable probe skipped (mktemp failed)"
+      else
+        python3 - "$wf" >"$gd/gate.sh" <<'PY' 2>/dev/null || true
+import sys, yaml
+wf = yaml.safe_load(open(sys.argv[1]))
+for job in wf.get("jobs", {}).values():
+    for step in job.get("steps", []):
+        if "run" in step:
+            sys.stdout.write(step["run"])
+PY
+        if [ ! -s "$gd/gate.sh" ]; then
+          echo "  S1 executable probe skipped (could not extract run-script)"
+        else
+          sed -e 's/\${{ github.repository }}/test\/repo/g' \
+              -e 's/\${{ github.event.pull_request.number }}/1/g' \
+              "$gd/gate.sh" >"$gd/gate.run.sh"
+          mkdir -p "$gd/bin"
+          cat >"$gd/bin/gh" <<'GH'
+#!/usr/bin/env bash
+args="$*"
+case "$FAKE_MODE" in
+  rename)
+    case "$args" in
+      */files*) printf '%s\n' '{"filename":"dspace-api/Foo.java"}' \
+                                '{"filename":"tools/test-graph/x.sh.new","previous_filename":"tools/test-graph/x.sh"}';;
+      *) echo 2;;
+    esac;;
+  overcap)
+    case "$args" in
+      */files*) printf '%s\n' '{"filename":"dspace-api/Foo.java"}';;
+      *) echo 5000;;
+    esac;;
+  inert)
+    case "$args" in
+      */files*) printf '%s\n' '{"filename":"dspace-api/Foo.java"}';;
+      *) echo 1;;
+    esac;;
+esac
+GH
+          chmod +x "$gd/bin/gh"
+          local rc
+          FAKE_MODE=rename PATH="$gd/bin:$PATH" GH_TOKEN=dummy bash "$gd/gate.run.sh" >"$gd/o1" 2>&1; rc=$?
+          [ "$rc" -ne 0 ] || { echo "  S1 gate MISSED a rename-out of a protected path"; ok=0; }
+          grep -q 'modifies the test pipeline' "$gd/o1" || { echo "  S1 gate rename path gave no reason"; ok=0; }
+          FAKE_MODE=overcap PATH="$gd/bin:$PATH" GH_TOKEN=dummy bash "$gd/gate.run.sh" >"$gd/o2" 2>&1; rc=$?
+          [ "$rc" -ne 0 ] || { echo "  S1 gate MISSED an over-cap file list"; ok=0; }
+          grep -q 'Cannot fully enumerate' "$gd/o2" || { echo "  S1 gate over-cap path gave no reason"; ok=0; }
+          FAKE_MODE=inert PATH="$gd/bin:$PATH" GH_TOKEN=dummy bash "$gd/gate.run.sh" >"$gd/o3" 2>&1; rc=$?
+          [ "$rc" -eq 0 ] || { echo "  S1 gate false-positives on an inert PR"; ok=0; }
+        fi
+        rm -rf "$gd"
+      fi
+    fi
+  fi
+
+  if [ "$ok" -eq 1 ]; then pass "S1 immutable gate-integrity check + CODEOWNERS (executable rename/over-cap probe)"
   else fail "S1 gate-integrity"; fi
 }
 s1

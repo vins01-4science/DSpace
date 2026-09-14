@@ -308,6 +308,32 @@ jobs:
             fi
           fi
 
+          # S4 (mirror of test-affected.yml): the run is only valid if the selected
+          # classes actually produced reports. -DfailIfNoTests=false turns a
+          # renamed/stale class into a silent no-op, and a zero-execution run must
+          # not advance the baseline.
+          REPORTS="$(find . -path '*/target/*-reports/TEST-*.xml' -printf '%f\n' 2>/dev/null \
+            | sed -e 's/^TEST-//' -e 's/\.xml$//')"
+          RAN="$(printf '%s\n' "$REPORTS" | grep -c . || true)"
+          if [ "$RAN" -eq 0 ]; then
+            echo "!! tests were selected but NO surefire/failsafe reports were produced"
+            exit 1
+          fi
+          MISSING=0
+          for name in $(printf '%s\n' "$UT" "$IT" | tr ',' '\n'); do
+            [ -z "$name" ] && continue
+            base="${name##*.}"
+            if ! printf '%s\n' "$REPORTS" | grep -qE "(^|[.]|[$])${base}$"; then
+              echo "!! no test report for affected class: $name"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            echo "!! affected run did not execute every named class"
+            exit 1
+          fi
+          echo "report check OK: $RAN report(s), all named affected classes executed."
+
       - name: Build per-module delta partials
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |

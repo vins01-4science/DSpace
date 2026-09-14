@@ -323,14 +323,16 @@ public class TestGraph {
         if (!Files.exists(root)) return;
         try (var stream = Files.walk(root)) {
             for (Path p : stream.filter(f -> f.toString().endsWith(".class")).toList()) {
-                for (String[] r : reflectionSitesOf(Files.readAllBytes(p))) {
+                String rel = root.relativize(p).toString()
+                        .replace(".class", "").replace('/', '.');
+                for (String[] r : reflectionSitesOf(Files.readAllBytes(p), rel)) {
                     rows.add(r[0] + "\t" + r[1] + "\t" + r[2]);
                 }
             }
         }
     }
 
-    private static List<String[]> reflectionSitesOf(byte[] bytes) {
+    private static List<String[]> reflectionSitesOf(byte[] bytes, String fallbackOwner) {
         List<String[]> sites = new ArrayList<>();
         try {
             ClassReader cr = new ClassReader(bytes);
@@ -423,6 +425,13 @@ public class TestGraph {
                             } else if ("java/lang/String".equals(callOwner)
                                     && "concat".equals(callName) && lastString != null) {
                                 concatPrefix = lastString;
+                            } else if ("java/lang/String".equals(callOwner)
+                                    && "format".equals(callName) && lastString != null
+                                    && lastString.indexOf('%') >= 0) {
+                                // G3: String.format("org.dspace.core.%s", n) builds a dynamic
+                                // target; the text before the first '%' is a namespace border.
+                                String head = lastString.substring(0, lastString.indexOf('%'));
+                                if (head.endsWith(".")) concatPrefix = head;
                             }
 
                             String kind = null;
@@ -464,7 +473,10 @@ public class TestGraph {
                 }
             }, 0);
         } catch (Exception ignored) {
-            // skip unreadable class files
+            // G10: an unparseable class must fail closed. Emit a dynamic site for the
+            // class itself so a change to it forces the full reactor, instead of
+            // silently contributing zero reflection sites.
+            sites.add(new String[]{topLevel(fallbackOwner), "reflect", ""});
         }
         return sites;
     }
@@ -1761,10 +1773,11 @@ public class TestGraph {
                 if (hit) inScope.add(test);
             }
 
-            // NEVER under-select: if line-level narrowing dropped every candidate, fall
-            // back to the class-level candidate union (same guarantee as the no-coverage
-            // degraded path). A stale/missing coverage blob for a changed class can
-            // therefore never turn into "0 tests to re-run".
+            // Fallback only when line-level narrowing dropped EVERY candidate: revert to
+            // the class-level union so a stale/missing coverage blob cannot turn into
+            // "0 tests to re-run". This is a floor, not a soundness guarantee: a non-empty
+            // narrowed subset can still omit a class-level test that a semantics-modifying
+            // change would break (G4).
             if (haveCoverage && inScope.isEmpty() && !candidates.isEmpty()) {
                 inScope.addAll(candidates);
                 fellBack = true;
