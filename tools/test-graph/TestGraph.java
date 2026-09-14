@@ -57,6 +57,8 @@ import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.Handle;
+import org.objectweb.asm.ConstantDynamic;
 
 /**
  * Single-file tool that builds and queries a test/class dependency graph for
@@ -196,6 +198,28 @@ public class TestGraph {
                         }
 
                         @Override
+                        public void visitInvokeDynamicInsn(String name, String descriptor,
+                                                           Handle bsm, Object... bsmArgs) {
+                            // Dynamic-dispatch edge (Phase 4): lambdas, method references and
+                            // other invokedynamic sites reference classes only at runtime; the
+                            // bootstrap method and its handle/type arguments name the real targets.
+                            addMethodDescTypes(descriptor, refs);
+                            if (bsm != null) {
+                                refs.add(new Ref(internalToFqcn(bsm.getOwner()), "indy"));
+                            }
+                            if (bsmArgs != null) {
+                                for (Object a : bsmArgs) addValue(a, refs);
+                            }
+                        }
+
+                        @Override
+                        public void visitLdcInsn(Object value) {
+                            // Class literals, method handles and condy carry class references
+                            // that are invisible to descriptor scanning.
+                            addValue(value, refs);
+                        }
+
+                        @Override
                         public org.objectweb.asm.AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
                             addDescTypes(descriptor, refs);
                             return null;
@@ -234,6 +258,36 @@ public class TestGraph {
         if (t == null) return;
         if (t.getSort() == Type.ARRAY) t = t.getElementType();
         if (t.getSort() == Type.OBJECT) refs.add(new Ref(t.getInternalName(), "uses"));
+    }
+
+    /**
+     * Extract class references from an ldc/invokedynamic constant: class literals
+     * ({@link Type}), method handles ({@link Handle}) and their constant-dynamic
+     * ({@link ConstantDynamic}) variants. Method types are expanded so captured
+     * functional-interface signatures still yield edges. Errors are ignored so a
+     * malformed constant can never abort extraction.
+     */
+    private static void addValue(Object value, List<Ref> refs) {
+        try {
+            if (value instanceof Type t) {
+                if (t.getSort() == Type.METHOD) {
+                    addMethodDescTypes(t.getDescriptor(), refs);
+                } else {
+                    addType(t, refs);
+                }
+            } else if (value instanceof Handle h) {
+                refs.add(new Ref(internalToFqcn(h.getOwner()), "indy"));
+            } else if (value instanceof ConstantDynamic cd) {
+                addDescTypes(cd.getDescriptor(), refs);
+                Handle bsm = cd.getBootstrapMethod();
+                if (bsm != null) refs.add(new Ref(internalToFqcn(bsm.getOwner()), "indy"));
+                for (int i = 0; i < cd.getBootstrapMethodArgumentCount(); i++) {
+                    addValue(cd.getBootstrapMethodArgument(i), refs);
+                }
+            }
+        } catch (Exception ignored) {
+            // ignore malformed constants
+        }
     }
 
     // ------------------------------------------------------------- reflection

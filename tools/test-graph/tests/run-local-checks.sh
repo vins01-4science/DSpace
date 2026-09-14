@@ -337,6 +337,18 @@ STUB
 }
 r2
 
+r3() {
+  local tg="$TG/TestGraph.java" ok=1
+  # Phase 4 dynamic-dispatch edges: invokedynamic bootstrap/handles, class literals,
+  # method handles and ConstantDynamic are extracted as class references.
+  for pat in 'addValue' 'ConstantDynamic' 'getBootstrapMethod' 'org.objectweb.asm.Handle' '"indy"' ; do
+    grep -qF -- "$pat" "$tg" || { echo "  R3 TestGraph missing: $pat"; ok=0; }
+  done
+  if [ "$ok" -eq 1 ]; then pass "R3 dynamic-dispatch edges extracted (indy/handles/class literals)"
+  else fail "R3 dynamic-dispatch edge wiring"; fi
+}
+r3
+
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"
 else
