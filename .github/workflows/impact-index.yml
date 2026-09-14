@@ -176,9 +176,13 @@ jobs:
           echo "MAVEN_OPTS=-Xmx2048M -Dmaven.build.cache.configPath=$RUNNER_TEMP/build-cache-config/maven-build-cache-config.xml -Dmaven.build.cache.location=$HOME/.m2/build-cache" >> "$GITHUB_ENV"
 
       # dspace-test-trace is NOT part of the reactor (added as a test dependency
-      # by the test-class-graph profile), so install it explicitly.
+      # by the test-class-graph profile), so install it explicitly. Bypass the
+      # build cache so the installed jar always reflects the checked-out source.
       - name: Install dspace-test-trace listener
-        run: mvn -B -V install -f dspace-test-trace/pom.xml -DskipTests
+        run: |
+          rm -rf "$HOME/.m2/repository/org/dspace/dspace-test-trace"
+          mvn -B -V install -f dspace-test-trace/pom.xml -DskipTests \
+            -Dmaven.build.cache.enabled=false
 
       # Assemble the test install (dspace-server-webapp test environment) once,
       # so every module's tests (notably dspace-api's AbstractDSpaceTest) can run.
@@ -299,6 +303,20 @@ jobs:
               mvn -B -V dependency:get -Dartifact="$artifact"
             fi
           done
+
+      # The `assemble` job installs the listener on ITS OWN runner; this shard
+      # job runs on a different runner and gets dspace-test-trace from the
+      # `cache: maven` restore, whose key is the pom.xml hash only. A listener
+      # SOURCE change (e.g. the S7 stable-key suffix) therefore does NOT
+      # invalidate that cache, so shards would silently use a stale listener and
+      # emit plain `Class.method` keys while merge-patch emits `Class.method__N`.
+      # Rebuild it here, bypassing the build cache, so every shard uses the
+      # listener from the checked-out source.
+      - name: Rebuild dspace-test-trace listener from source
+        run: |
+          rm -rf "$HOME/.m2/repository/org/dspace/dspace-test-trace"
+          mvn -o -B -V install -f dspace-test-trace/pom.xml -DskipTests \
+            -Dmaven.build.cache.enabled=false
 
       # dspace-test-trace + all upstream modules are already in the Maven cache
       # (populated by the `assemble` job), so only this module is built/tested.

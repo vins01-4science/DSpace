@@ -724,6 +724,23 @@ s7() {
     echo "  S7 still uses the truncating single-file key"; ok=0
   fi
 
+  # Cross-build-path consistency: the shard (impact-index) and incremental
+  # (merge-patch) paths must both install the listener from source. The
+  # `cache: maven` key only reflects pom.xml, so a listener source change would
+  # otherwise leave shards with a stale jar and emit plain keys while
+  # merge-patch emits `__N` keys.
+  local ii="$ROOT/.github/workflows/impact-index.yml" mp="$ROOT/.github/workflows/merge-patch.yml"
+  grep -qF 'Rebuild dspace-test-trace listener from source' "$ii" \
+    || { echo "  S7 impact-index does not rebuild the listener per shard"; ok=0; }
+  grep -qF 'maven.build.cache.enabled=false' "$ii" \
+    || { echo "  S7 impact-index listener install does not bypass the build cache"; ok=0; }
+  grep -qF 'repository/org/dspace/dspace-test-trace' "$ii" \
+    || { echo "  S7 impact-index does not purge the cached listener"; ok=0; }
+  grep -qF 'install -f dspace-test-trace/pom.xml' "$mp" \
+    || { echo "  S7 merge-patch does not install the listener in-job"; ok=0; }
+  grep -qF 'deliberately NOT used' "$mp" \
+    || { echo "  S7 merge-patch unexpectedly enables the build cache"; ok=0; }
+
   # Executable: compile the real listener and call execFileName twice — the names
   # must differ (no overwrite) and `$` must survive the sanitizer (nested selectable).
   local cp="" j
