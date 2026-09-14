@@ -70,7 +70,10 @@ for M in $MODULES; do
   # static graph + config refs + per-module index
   "$TG" static   --module "$M"
   "$TG" config   --module "$M" $ROOT_ARG
-  "$TG" build    --module "$M"
+  # Pass both class roots: test classes carry coverage (property impact) AND are
+  # what stale-key pruning (G6) matches per-test keys against.
+  "$TG" build    --module "$M" \
+    --classes "$REPO/$M/target/classes:$REPO/$M/target/test-classes"
   DB="$REPO/$M/target/test-graph/impact-index.sqlite"
   if [[ -f "$DB" ]]; then
     DBS+=("$DB")

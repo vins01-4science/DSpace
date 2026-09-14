@@ -247,6 +247,11 @@ jobs:
           echo "ut=$UT" >> "$GITHUB_OUTPUT"
           echo "it=$IT" >> "$GITHUB_OUTPUT"
           echo "modules=$FALLBACK_MODULES" >> "$GITHUB_OUTPUT"
+          # prune=1 only on a blast/full-reactor run, where EVERY module was
+          # recompiled. Then a test class missing from target/test-classes is
+          # genuinely gone and can be pruned from the merged index (G6). A
+          # narrowed run must NOT prune: unrebuilt modules would lose live tests.
+          echo "prune=$BLAST" >> "$GITHUB_OUTPUT"
 
       - name: Run affected tests with per-test coverage
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
@@ -368,6 +373,17 @@ jobs:
           for f in $(find target/test-graph/deltas -name 'delta-*.sqlite' | sort); do
             ARGS+=(--db$i "$f"); i=$((i+1))
           done
+          # G6: on a full-reactor run every module compiled, so prune test keys
+          # whose class no longer exists. On a narrowed run, skip pruning so an
+          # unrebuilt module's live tests are never dropped.
+          if [ "${{ steps.affected.outputs.prune }}" = "1" ]; then
+            test_classes="$(find . -maxdepth 3 -type d -name test-classes -print | paste -sd: -)"
+            if [ -z "$test_classes" ]; then
+              echo "!! full-reactor run but no compiled test-classes found; refusing to skip pruning silently" >&2
+              exit 1
+            fi
+            ARGS+=(--test-classes "$test_classes")
+          fi
           bash tools/test-graph/run.sh "${ARGS[@]}" > target/test-graph/aggregate.log
           tail -5 target/test-graph/aggregate.log
 

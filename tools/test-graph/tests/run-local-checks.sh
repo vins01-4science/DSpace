@@ -562,7 +562,76 @@ GH
   if [ "$ok" -eq 1 ]; then pass "S1 immutable gate-integrity check + CODEOWNERS (executable rename/over-cap probe)"
   else fail "S1 gate-integrity"; fi
 }
+
+g6() {
+  local tg="$TG/TestGraph.java" mp="$ROOT/.github/workflows/merge-patch.yml" ok=1
+  # G6/H4: stale test keys must be pruned (build + aggregate) and the merge-patch
+  # full-reactor run must pass the compiled test-classes so the prune can fire.
+  for pat in 'compiledClasses(' 'testClassOf(' 'testClassRoots(' '--test-classes' \
+             'stale per-test key(s)' 'stale test key(s)'; do
+    grep -qF -- "$pat" "$tg" || { echo "  G6 TestGraph.java missing: $pat"; ok=0; }
+  done
+  for pat in 'prune=$BLAST' '--test-classes' 'steps.affected.outputs.prune'; do
+    grep -qF -- "$pat" "$mp" || { echo "  G6 merge-patch.yml missing: $pat"; ok=0; }
+  done
+
+  # Executable: exercise the real `aggregate` prune against a tiny synthetic DB.
+  # Skipped when the test-graph runtime jars are not in the local .m2 (CI).
+  local m2="${M2:-$HOME/.m2/repository}" j
+  local jars_ok=1
+  for j in org/jacoco/org.jacoco.core org/ow2/asm/asm org/ow2/asm/asm-tree \
+           org/ow2/asm/asm-commons org/xerial/sqlite-jdbc; do
+    [ -n "$(find "$m2/$j" -name '*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | head -1)" ] \
+      || jars_ok=0
+  done
+  if [ "$jars_ok" -eq 0 ] || ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "  G6 executable prune probe skipped (runtime jars / sqlite3 absent)"
+  else
+    local d mod src out1 out2 rc
+    d="$(newtmp)"; mod="$d/mod"; src="$d/src.sqlite"
+    mkdir -p "$mod/target/test-classes/org/x"
+    : > "$mod/target/test-classes/org/x/KeepTest.class"
+    sqlite3 "$src" <<'SQL'
+CREATE TABLE class_refs(from_c TEXT,to_c TEXT,kind TEXT);
+CREATE TABLE cov_test(id INTEGER PRIMARY KEY,name TEXT);
+CREATE TABLE cov_class(id INTEGER PRIMARY KEY,name TEXT);
+CREATE TABLE cov_data(class_id INTEGER PRIMARY KEY,blob BLOB);
+CREATE TABLE property_refs(from_c TEXT,key TEXT,kind TEXT);
+CREATE TABLE bean_refs(from_c TEXT,ref TEXT,kind TEXT);
+CREATE TABLE config_keys(file TEXT,key TEXT);
+CREATE TABLE bean_decls(file TEXT,bean_type TEXT,bean_id TEXT);
+CREATE TABLE config_consumers(file TEXT,class TEXT);
+INSERT INTO cov_test VALUES (0,'org.x.KeepTest.probe'),(1,'org.x.GoneTest.probe');
+SQL
+    rc=0
+    M2="$m2" bash "$TG/run.sh" aggregate --out "$d/out1.sqlite" --db "$src" \
+      --test-classes "$mod/target/test-classes" > "$d/log1" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "  G6 aggregate (--test-classes) failed rc=$rc:"; sed 's/^/    /' "$d/log1"; ok=0
+    else
+      local names
+      names="$(sqlite3 "$d/out1.sqlite" 'SELECT name FROM cov_test' 2>/dev/null)"
+      printf '%s\n' "$names" | grep -q 'org.x.KeepTest.probe' || { echo "  G6 pruned a live test class"; ok=0; }
+      printf '%s\n' "$names" | grep -q 'org.x.GoneTest.probe' && { echo "  G6 kept a stale test class"; ok=0; }
+    fi
+    rc=0
+    M2="$m2" bash "$TG/run.sh" aggregate --out "$d/out2.sqlite" --db "$src" \
+      > "$d/log2" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "  G6 aggregate (no --test-classes) failed rc=$rc:"; sed 's/^/    /' "$d/log2"; ok=0
+    else
+      local names2
+      names2="$(sqlite3 "$d/out2.sqlite" 'SELECT name FROM cov_test' 2>/dev/null)"
+      printf '%s\n' "$names2" | grep -q 'org.x.GoneTest.probe' || { echo "  G6 pruned without test-classes (unsafe)"; ok=0; }
+    fi
+  fi
+
+  if [ "$ok" -eq 1 ]; then pass "G6 stale test-key pruning (build + aggregate + merge-patch wiring)"
+  else fail "G6 stale test-key pruning"; fi
+}
+
 s1
+g6
 
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"

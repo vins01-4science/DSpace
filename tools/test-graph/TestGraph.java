@@ -1135,6 +1135,52 @@ public class TestGraph {
         return deflate(o.toByteArray());
     }
 
+    /**
+     * FQCNs of every compiled class under the given roots (e.g.
+     * {@code target/test-classes}). Used to prune per-test keys whose owning
+     * class no longer exists, so a renamed or deleted test cannot leave a stale
+     * key that {@code impacted} re-selects forever.
+     */
+    private static Set<String> compiledClasses(List<Path> dirs) {
+        Set<String> names = new HashSet<>();
+        for (Path dir : dirs) {
+            if (!Files.isDirectory(dir)) continue;
+            try (var stream = Files.walk(dir)) {
+                stream.filter(p -> p.toString().endsWith(".class")).forEach(p -> {
+                    String rel = dir.relativize(p).toString();
+                    rel = rel.substring(0, rel.length() - ".class".length());
+                    names.add(rel.replace(File.separatorChar, '.').replace('/', '.'));
+                });
+            } catch (IOException e) {
+                // unreadable root: return what we have; an empty set disables pruning
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Keep only roots literally named {@code test-classes}: pruning is only safe
+     * against a real compiled test tree, never against main classes (a main-class
+     * root would make every test key look stale).
+     */
+    private static List<Path> testClassRoots(List<Path> dirs) {
+        List<Path> roots = new ArrayList<>();
+        for (Path d : dirs) {
+            Path n = d.getFileName();
+            if (n != null && n.toString().equals("test-classes")) roots.add(d);
+        }
+        return roots;
+    }
+
+    /**
+     * The class part of a per-test key: {@code Class.method} or, since S7,
+     * {@code Class.method__<jvm>_<seq>}. A name with no dot is treated as a class.
+     */
+    private static String testClassOf(String key) {
+        int i = key.lastIndexOf('.');
+        return i < 0 ? key : key.substring(0, i);
+    }
+
     // ------------------------------------------------------------------ build
 
     private static void buildCmd(Map<String, String> opts) throws Exception {
@@ -1180,17 +1226,23 @@ public class TestGraph {
             try (var stream = Files.walk(perTest)) {
                 execs = stream.filter(f -> f.toString().endsWith(".exec")).sorted().toList();
             }
-            // LIMITATION (round-3 H4): the per-test key is the raw exec filename,
-            // and nested classes are folded onto their top-level class above. A
-            // renamed/removed test therefore leaves a stale key that `impacted`
-            // can still name, and `$`-suffixed nested classes share coverage with
-            // their outer class. Stale classes are only caught when the affected
-            // list is non-empty (the zero-report backstop in the workflows); the
-            // fix is deferred, documented here.
+            // Stale-key pruning (G6 / round-3 H4): a per-test key is the raw exec
+            // filename, so a renamed or deleted test class can leave an exec file
+            // whose class no longer compiles. Drop those keys instead of indexing
+            // them, so `impacted` cannot re-select a class that no longer exists.
+            // Pruning is skipped when we have no compiled classes to check against
+            // (classDirs empty or unreadable), i.e. it never guesses.
+            Set<String> compiled = compiledClasses(testClassRoots(classDirs));
+            Set<String> knownClasses = compiled.isEmpty() ? null : compiled;
+            int prunedTests = 0;
             for (Path exec : execs) {
                 if (Files.size(exec) == 0) continue;
                 String key = exec.getFileName().toString();
                 key = key.substring(0, key.length() - ".exec".length());
+                if (knownClasses != null && !knownClasses.contains(testClassOf(key))) {
+                    prunedTests++;
+                    continue;
+                }
                 Set<String> set = covered.computeIfAbsent(key, k -> new HashSet<>());
                 ExecFileLoader loader = new ExecFileLoader();
                 loader.load(exec.toFile());
@@ -1257,6 +1309,10 @@ public class TestGraph {
                         prev = ln;
                     }
                 }
+            }
+            if (prunedTests > 0) {
+                System.out.println("build: pruned " + prunedTests
+                        + " stale per-test key(s) with no compiled class");
             }
         }
 
@@ -2068,6 +2124,17 @@ public class TestGraph {
         if (dbs.isEmpty()) dbs.add(Paths.get(require(opts, "db")));
         Path out = Paths.get(require(opts, "out"));
         Files.createDirectories(out.getParent());
+        // Optional: compiled test-class roots. When supplied, test keys whose
+        // class no longer exists are pruned before they are written (G6 / H4),
+        // so a renamed/deleted test cannot survive a merge-patch union forever.
+        // Callers must only pass dirs for a fully compiled reactor, otherwise a
+        // not-rebuilt module's live tests would be dropped (under-selection).
+        List<Path> testClassDirs = new ArrayList<>();
+        if (opts.containsKey("test-classes")) {
+            for (String d : opts.get("test-classes").split(File.pathSeparator)) {
+                if (!d.isEmpty()) testClassDirs.add(Paths.get(d));
+            }
+        }
 
         Map<String, Set<String>> refs = new HashMap<>();
         // Deduped: when merging shards of the *same* module, the module-level
@@ -2117,6 +2184,20 @@ public class TestGraph {
                     allTests.add(r[1]);
                 }
                 for (String[] r : readDb(sc, "SELECT name FROM cov_class")) allClasses.add(r[0]);
+            }
+
+            // G6 / H4: drop test keys whose class is absent from the compiled
+            // test-classes of the current tree. No-op when no dirs were supplied
+            // (e.g. a narrowed merge-patch run where not every module was rebuilt).
+            Set<String> validTests = compiledClasses(testClassRoots(testClassDirs));
+            if (!validTests.isEmpty()) {
+                int before = allTests.size();
+                allTests.removeIf(t -> !validTests.contains(testClassOf(t)));
+                int dropped = before - allTests.size();
+                if (dropped > 0) {
+                    System.out.println("aggregate: pruned " + dropped
+                            + " stale test key(s) with no compiled class");
+                }
             }
 
             // global test ids, assigned in name order so per-class deltas stay >= 0
@@ -2218,8 +2299,18 @@ public class TestGraph {
                         ps4.addBatch();
                         cid++;
                         Set<String> ks = closureKeys.get(cls);
-                        if (ks != null)
-                            for (String k : ks) propImpact.computeIfAbsent(k, x -> new HashSet<>()).addAll(merged.keySet());
+                        if (ks != null) {
+                            // Only carry tests that survived pruning: a pruned
+                            // name has no cov_test row, so it must not leak into
+                            // property_impact either (else `impacted --property`
+                            // would re-emit a class that no longer exists).
+                            Set<String> live = new HashSet<>();
+                            for (String t : merged.keySet())
+                                if (gTestIds.containsKey(t)) live.add(t);
+                            if (!live.isEmpty())
+                                for (String k : ks)
+                                    propImpact.computeIfAbsent(k, x -> new HashSet<>()).addAll(live);
+                        }
                     }
                     nClasses = cid;
                     for (Map.Entry<String, Set<String>> e : propImpact.entrySet())
@@ -2456,7 +2547,7 @@ public class TestGraph {
         System.out.println("  refine      --db <file> (--diff <file|-> | --base <ref> [--head <ref>]) [--classes <dir>]");
         System.out.println("  validate    --module <dir> [--per-test dir] [--db file]");
         System.out.println("  reflection-resolve --db <file>   (reads changed FQCNs on stdin)");
-        System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...]");
+        System.out.println("  aggregate   --out <file> --db <m1> [--db2 <m2> ...] [--test-classes <dirs>]");
     }
 
     private static final class Ref {
