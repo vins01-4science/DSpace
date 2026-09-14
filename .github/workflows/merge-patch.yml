@@ -370,11 +370,27 @@ jobs:
         if: steps.baseline.outputs.db != '' && steps.affected.outputs.skip != '1'
         run: |
           ARGS=("aggregate" "--out" "target/test-graph/root-index.sqlite")
-          ARGS+=(--db "${{ steps.baseline.outputs.db }}")
+          first=1
           i=2
+          # Self-cleaning full rebuild: when every module was rebuilt (prune=1)
+          # the fresh deltas ARE the complete index, so do NOT merge the prior
+          # baseline. Merging it is what let stale/volatile test keys accumulate
+          # without bound. A narrowed run still merges onto the baseline.
+          if [ "${{ steps.affected.outputs.prune }}" != "1" ]; then
+            ARGS+=(--db "${{ steps.baseline.outputs.db }}")
+            first=0
+          fi
           for f in $(find target/test-graph/deltas -name 'delta-*.sqlite' | sort); do
-            ARGS+=(--db$i "$f"); i=$((i+1))
+            if [ "$first" = "1" ]; then
+              ARGS+=(--db "$f"); first=0
+            else
+              ARGS+=(--db$i "$f"); i=$((i+1))
+            fi
           done
+          if [ "$first" = "1" ]; then
+            echo "!! aggregate has no index input (no baseline and no deltas)" >&2
+            exit 1
+          fi
           # G6: on a full-reactor run every module compiled, so prune test keys
           # whose class no longer exists. On a narrowed run, skip pruning so an
           # unrebuilt module's live tests are never dropped.
