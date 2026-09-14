@@ -424,6 +424,23 @@ s12() {
 }
 s12
 
+s7() {
+  local pc="$ROOT/dspace-test-trace/src/main/java/org/dspace/testtrace/PerTestCoverage.java" ok=1
+  [ -f "$pc" ] || { fail "S7 PerTestCoverage.java not found"; return; }
+  # Unique per-invocation key: a per-JVM token + monotonic sequence appended to the
+  # sanitized stem, so parameterized tests / retries no longer overwrite one file.
+  for pat in 'AtomicLong' 'ProcessHandle' 'JVM' '"__"' 'Outer$Inner' '[^a-zA-Z0-9.$_-]'; do
+    grep -qF -- "$pat" "$pc" || { echo "  S7 PerTestCoverage missing: $pat"; ok=0; }
+  done
+  # The old truncating single-file key must be gone.
+  if grep -qF 'safe + ".exec"' "$pc"; then
+    echo "  S7 still uses the truncating single-file key"; ok=0
+  fi
+  if [ "$ok" -eq 1 ]; then pass "S7 per-invocation coverage keys (no overwrite; \$ preserved)"
+  else fail "S7 per-invocation keys"; fi
+}
+s7
+
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"
 else

@@ -13,6 +13,7 @@ import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
@@ -32,7 +33,10 @@ import org.junit.platform.launcher.TestPlan;
  * <p>It talks to the JaCoCo runtime agent through its JMX MBean
  * ({@code org.jacoco:type=Runtime}, interface {@code org.jacoco.agent.rt.IAgent}).
  * After every test method it requests the current execution data (which also resets
- * the agent) and writes it to {@code target/per-test/<Class>.<method>.exec}.</p>
+ * the agent) and writes it to
+ * {@code target/per-test/<Class>.<method>__<jvm>_<seq>.exec}. The per-invocation
+ * suffix keeps repeated invocations of the same method (parameterized tests,
+ * retries) in separate files instead of overwriting one file.</p>
  *
  * <p>Because DSpace runs JUnit 4 tests through the JUnit Vintage engine on top of the
  * JUnit Platform, a single listener registered via the
@@ -46,6 +50,12 @@ public class PerTestCoverage implements TestExecutionListener {
 
     private static final String MBEAN_NAME = "org.jacoco:type=Runtime";
     private static final Path OUT_DIR = Paths.get("target", "per-test");
+
+    /** Per-JVM token so two forked JVMs cannot collide on the same sequence number. */
+    private static final String JVM = Long.toHexString(ProcessHandle.current().pid());
+
+    /** Monotonic per-invocation sequence, so repeated runs of one method never overwrite. */
+    private static final AtomicLong SEQ = new AtomicLong();
 
     private final ObjectName objectName;
     private final MBeanServer server;
@@ -104,15 +114,17 @@ public class PerTestCoverage implements TestExecutionListener {
     }
 
     private void write(byte[] data, TestIdentifier testIdentifier) throws Exception {
-        // LIMITATION (round-3 H3): the exec file is keyed by the sanitized
-        // `Class.method`:
-        //   - repeated invocations of one method (parameterized/retries) overwrite
-        //     the same file, so the last invocation wins;
-        //   - @Nested tests collapse to `Outer_Inner` (the '.' is sanitized to
-        //     '_'), a name `-Dtest` cannot select;
-        //   - two method names differing only in sanitized characters collide.
-        // The class-level coverage union stays conservative (over-selects, never
-        // under-selects); per-invocation keys are a future fix, documented here.
+        // S7 (round-3): the exec file is keyed by the sanitized `Class.method`
+        // PLUS a per-JVM, per-invocation suffix (`__<jvm>_<seq>`), so:
+        //   - repeated invocations of one method (parameterized tests, retries) land
+        //     in separate files; the index unions their coverage instead of keeping
+        //     only the last invocation (which could drop the changed class);
+        //   - `$` is preserved (allowed by the sanitizer), so @Nested tests keep
+        //     `Outer$Inner` and stay selectable via `-Dtest=Outer$Inner`.
+        // Remaining limitation: two method names differing only in characters
+        // outside [A-Za-z0-9.$_-] still collide (they sanitize to the same stem);
+        // the class-level coverage union stays conservative, so this over-selects
+        // rather than under-selects.
         String className = "unknown";
         String methodName = "test";
         TestSource source = testIdentifier.getSource().orElse(null);
@@ -123,8 +135,9 @@ public class PerTestCoverage implements TestExecutionListener {
             className = classSource.getClassName();
         }
         Files.createDirectories(OUT_DIR);
-        String safe = (className + "." + methodName).replaceAll("[^a-zA-Z0-9._-]", "_");
-        File out = OUT_DIR.resolve(safe + ".exec").toFile();
+        String safe = (className + "." + methodName).replaceAll("[^a-zA-Z0-9.$_-]", "_");
+        String unique = safe + "__" + JVM + "_" + Long.toHexString(SEQ.incrementAndGet());
+        File out = OUT_DIR.resolve(unique + ".exec").toFile();
         try (FileOutputStream fos = new FileOutputStream(out)) {
             fos.write(data);
         }
