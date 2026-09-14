@@ -1,0 +1,46 @@
+name: Gate integrity
+
+# S1: `on: pull_request` executes the workflow definition from the PR's merge ref,
+# which includes the PR's own head. A same-repo PR can therefore rewrite the
+# affected-test gate (test-affected.yml) to `exit 0` and still satisfy the required
+# check. This workflow uses `pull_request_target`, which ALWAYS runs this file from
+# the BASE branch and never checks out or executes PR code: it only reads the PR's
+# changed-file list over the API. If the PR edits the pipeline/gate itself, the check
+# fails loudly instead of letting the change certify itself.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: gate-integrity-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate-integrity:
+    name: gate-integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject PRs that modify the test pipeline / gate itself
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Paths whose change would let a PR alter how its own verdict is computed.
+          PROTECTED='^(\.github/|tools/|dspace-test-trace/)'
+          files="$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].filename')"
+          hits="$(printf '%s\n' "$files" | grep -E "$PROTECTED" || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::This PR modifies the test pipeline / gate itself:"
+            printf '%s\n' "$hits"
+            echo "The affected-test gate cannot certify a PR that edits the gate."
+            echo "A maintainer must review and merge this change deliberately."
+            exit 1
+          fi
+          echo "No gate or pipeline files modified."

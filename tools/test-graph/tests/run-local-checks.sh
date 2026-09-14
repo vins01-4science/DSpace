@@ -464,6 +464,29 @@ s14() {
 }
 s14
 
+s1() {
+  local wf="$ROOT/.github/workflows/gate-integrity.yml" co="$ROOT/.github/CODEOWNERS" ok=1
+  # S1: an immutable pull_request_target gate must flag PRs that edit the pipeline
+  # itself, and CODEOWNERS must name the protected paths for reviewer enforcement.
+  [ -f "$wf" ] || { echo "  S1 gate-integrity.yml missing"; ok=0; }
+  [ -f "$co" ] || { echo "  S1 CODEOWNERS missing"; ok=0; }
+  if [ -f "$wf" ]; then
+    grep -qF 'pull_request_target' "$wf" || { echo "  S1 gate is not pull_request_target"; ok=0; }
+    grep -qF 'exit 1' "$wf" || { echo "  S1 gate does not fail the check"; ok=0; }
+    grep -qF '\.github/' "$wf" || { echo "  S1 gate missing .github/ path"; ok=0; }
+    grep -qF 'tools/' "$wf" || { echo "  S1 gate missing tools/ path"; ok=0; }
+    grep -qF 'dspace-test-trace/' "$wf" || { echo "  S1 gate missing dspace-test-trace/ path"; ok=0; }
+  fi
+  if [ -f "$co" ]; then
+    grep -qF '/.github/' "$co" || { echo "  S1 CODEOWNERS missing /.github/"; ok=0; }
+    grep -qF '/tools/' "$co" || { echo "  S1 CODEOWNERS missing /tools/"; ok=0; }
+    grep -qF '/dspace-test-trace/' "$co" || { echo "  S1 CODEOWNERS missing /dspace-test-trace/"; ok=0; }
+  fi
+  if [ "$ok" -eq 1 ]; then pass "S1 immutable gate-integrity check + CODEOWNERS"
+  else fail "S1 gate-integrity"; fi
+}
+s1
+
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"
 else
