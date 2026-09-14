@@ -286,6 +286,57 @@ r1() {
 }
 r1
 
+r2() {
+  local af="$TG/affected.sh" ok=1
+  # Phase-3 static wiring: a single refine pass over the diff replaces the per-file
+  # class-level `impacted --file` lookup for changed .java.
+  for pat in 'HAVE_JAVA' 'refine --csv --db "$DB" --diff' 'diff.patch' ; do
+    grep -qF -- "$pat" "$af" || { echo "  R2 affected.sh missing: $pat"; ok=0; }
+  done
+  if grep -qF -- 'impacted --csv --db "$DB" --file "$REPO/$f"' "$af"; then
+    echo "  R2 java arm still calls class-level impacted --file"; ok=0
+  fi
+  # Phase-3 functional: with a stubbed tool, the refined set must be what affected.sh
+  # emits for a changed .java, and no class-level --file lookup may be issued.
+  local dir base head ut
+  dir="$(newtmp)"
+  mkdir -p "$dir/tools/test-graph"
+  cp "$af" "$dir/tools/test-graph/affected.sh"
+  cat > "$dir/tools/test-graph/run.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+case "$*" in *"refine --csv"*) echo NarrowedTest ;; esac
+exit 0
+STUB
+  chmod +x "$dir/tools/test-graph/run.sh"
+  touch "$dir/db.sqlite"
+  (
+    cd "$dir" || exit 1
+    git init -q .
+    git config user.email t@t.t; git config user.name t
+    mkdir -p dspace-api/src/main/java/org/dspace/impact
+    printf 'base\n' > dspace-api/README
+    git add -A && git commit -qm base
+    base="$(git rev-parse HEAD)"
+    printf 'package org.dspace.impact;\npublic class Changed {}\n' \
+      > dspace-api/src/main/java/org/dspace/impact/Changed.java
+    git add -A && git commit -qm add
+    head="$(git rev-parse HEAD)"
+    export STUB_LOG="$dir/stub.log"; : > "$STUB_LOG"
+    bash tools/test-graph/affected.sh --db "$dir/db.sqlite" --base "$base" --head "$head" \
+      --out "$dir/out" >/dev/null 2>&1
+  ) || { fail "R2 affected.sh run crashed"; return; }
+  ut="$(cat "$dir/out/ut.csv" 2>/dev/null || true)"
+  if [ "$ut" != "NarrowedTest" ] || ! grep -q 'refine' "$dir/stub.log" \
+     || grep -q -- '--file' "$dir/stub.log"; then
+    ok=0
+    echo "  R2 functional: ut='$ut' (want NarrowedTest); refine_called=$(grep -c refine "$dir/stub.log" 2>/dev/null || echo 0); file_lookup=$(grep -c -- '--file' "$dir/stub.log" 2>/dev/null || echo 0)"
+  fi
+  if [ "$ok" -eq 1 ]; then pass "R2 method-level refine wired (java -> refine, no class-level --file)"
+  else fail "R2 refine wiring"; fi
+}
+r2
+
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"
 else

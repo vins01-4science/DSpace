@@ -86,6 +86,7 @@ declare -A TESTFILE=()
 # safety net below (ASM phase 0): a changed class that is a reflection hub — or a
 # name passed to Class.forName / loadClass / ServiceLoader — must fail closed.
 declare -a CHANGED_CLASSES=()
+HAVE_JAVA=0
 ERR_LOG="$OUT_DIR/impacted.err"
 : > "$ERR_LOG"
 
@@ -110,13 +111,11 @@ add_line() { # accept only class / class.method tokens; anything else = tool mis
 for f in "${FILES[@]:-}"; do
   [[ -z "$f" ]] && continue
   if is_java_src "$f"; then
+    HAVE_JAVA=1
     CHANGED_CLASSES+=("$(class_from_file "$f")")
     if is_test_file "$f"; then
       TESTFILE["$(class_from_file "$f")"]=1   # bare FQCN, no method
     fi
-    while IFS= read -r t; do
-      add_line "$t"
-    done < <(impacted_for impacted --csv --db "$DB" --file "$REPO/$f")
   elif is_cfg "$f"; then
     while IFS= read -r t; do
       add_line "$t"
@@ -136,6 +135,22 @@ for f in "${FILES[@]:-}"; do
                     --base "$BASE" --head "$HEAD")
   fi
 done
+
+# Method-level refinement (ASM phase 3). A single `refine` call over the whole diff
+# replaces the per-file class-level `impacted --file` lookups: refine starts from the
+# same class-level impacted union and narrows it to the tests that actually cover the
+# changed lines (cov_data in the index). It degrades to the class-level union when
+# coverage is absent, and falls back to that union if line narrowing empties the set,
+# so it can never under-select relative to class-level impact. One call (not one per
+# file) also avoids re-reading the whole diff N times.
+if [ "$HAVE_JAVA" -eq 1 ]; then
+  DIFF_PATCH="$OUT_DIR/diff.patch"
+  git diff --no-renames --diff-filter=ADMRT "$BASE...$HEAD" > "$DIFF_PATCH"
+  while IFS= read -r t; do
+    add_line "$t"
+  done < <(impacted_for refine --csv --db "$DB" --diff "$DIFF_PATCH")
+  rm -f "$DIFF_PATCH"
+fi
 
 # Reflection resolution (ASM phase 0/1). Static class references cannot see
 # Class.forName / ClassLoader.loadClass / ServiceLoader / reflection. Phase 1
