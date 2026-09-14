@@ -14,6 +14,10 @@
 #       surface and does not match docs.
 #   S4  the per-named-class assertion fails when a selected class produced no
 #       report and passes when it did.
+#   S9  affected.sh fails loud when the Java tool exits non-zero without writing
+#       stderr (a silent empty affected set must not pass).
+#   S12 split-tests.sh fails loud when a class carrying test/suite annotations
+#       matches neither surefire nor failsafe includes (coverage would be lost).
 #   R0  ASM phase-0 reflection safety net is wired end to end: TestGraph.java
 #       extracts reflection sites, affected.sh emits a force_full marker, and both
 #       workflows fail closed (full reactor) when the marker is present.
@@ -387,6 +391,38 @@ r3() {
   else fail "R3 dynamic-dispatch edge wiring"; fi
 }
 r3
+
+s12() {
+  local split="$TG/split-tests.sh" ok=1 dir base head
+  # Static: the fail-loud path exists.
+  for pat in 'UNMATCHED_TESTS' 'match neither' 'exit 1'; do
+    grep -qF -- "$pat" "$split" || { echo "  S12 split-tests missing: $pat"; ok=0; }
+  done
+  dir="$(newtmp)"
+  # Runnable class with a non-conventional name must NOT be silently dropped.
+  mkdir -p "$dir/bad/src/test/java/org/x"
+  printf 'package org.x;\nimport org.junit.Test;\npublic class FooSpec { @Test public void a(){} }\n' \
+    > "$dir/bad/src/test/java/org/x/FooSpec.java"
+  if bash "$split" --module "$dir/bad" --total 2 >"$dir/bad.log" 2>&1; then
+    echo "  S12: FooSpec (@Test, unmatched name) did not fail loud"; ok=0
+  elif ! grep -q 'match neither' "$dir/bad.log"; then
+    echo "  S12: FooSpec failed but without the missing-include message"; ok=0
+  fi
+  # A helper (no test annotation) and a normal *Test must both pass, BarTest sharded.
+  mkdir -p "$dir/ok/src/test/java/org/x"
+  printf 'package org.x;\nimport org.junit.Test;\npublic class BarTest { @Test public void a(){} }\n' \
+    > "$dir/ok/src/test/java/org/x/BarTest.java"
+  printf 'package org.x;\npublic class Helper { public static int x=1; }\n' \
+    > "$dir/ok/src/test/java/org/x/Helper.java"
+  if ! bash "$split" --module "$dir/ok" --total 2 >"$dir/ok.log" 2>&1; then
+    echo "  S12: helper-only module should not fail"; ok=0
+  elif ! grep -rq 'BarTest' "$dir/ok/target/test-graph"; then
+    echo "  S12: BarTest was not sharded"; ok=0
+  fi
+  if [ "$ok" -eq 1 ]; then pass "S12 split-tests fails loud on annotation-bearing unsharded tests"
+  else fail "S12 split-tests silent-drop guard"; fi
+}
+s12
 
 if [ "$FAIL" -eq 0 ]; then
   echo "ALL LOCAL CHECKS PASSED"

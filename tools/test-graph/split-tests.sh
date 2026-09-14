@@ -45,6 +45,7 @@ is_it() { [[ "$1" == IT* || "$1" == *IT || "$1" == *ITCase ]]; }
 UT=()
 IT=()
 UNMATCHED=()
+UNMATCHED_TESTS=()
 if [[ -d "$SRC" ]]; then
   while IFS= read -r f; do
     base="$(basename "$f" .java)"
@@ -53,7 +54,13 @@ if [[ -d "$SRC" ]]; then
     rel="${f#"$SRC"/}"; rel="${rel%.java}"; fqcn="${rel//\//.}"
     if is_it "$base"; then IT+=("$fqcn")
     elif is_ut "$base"; then UT+=("$fqcn")
-    else UNMATCHED+=("$fqcn")
+    else
+      UNMATCHED+=("$fqcn")
+      # A class with test/suite annotations that is NOT sharded would have its
+      # coverage silently missing from the index (under-selection). Track it.
+      if grep -qE '@(Test|ParameterizedTest|RepeatedTest|TestFactory|Suite|RunWith|Nested)\b' "$f" 2>/dev/null; then
+        UNMATCHED_TESTS+=("$fqcn")
+      fi
     fi
   done < <(find "$SRC" -name '*.java' -type f)
 fi
@@ -79,11 +86,18 @@ for ((i=0; i<TOTAL; i++)); do
   echo "  shard $i: ut=$u it=$t"
 done
 
-# Classes matching neither surefire nor failsafe default includes are NOT
-# sharded: their coverage never enters the index. Loud warning (latent today —
-# all current DSpace test classes match — but a pom <include> change flips it).
+# Classes matching neither surefire nor failsafe default includes are NOT sharded.
+# Helpers/mocks/resources (no test/suite annotation) are safe to skip, but a class
+# that actually carries tests cannot be silently dropped: its coverage would never
+# enter the index, so a future change to it would under-select. Fail loud instead.
+if ((${#UNMATCHED_TESTS[@]} > 0)); then
+  echo "split-tests: ERROR: ${#UNMATCHED_TESTS[@]} test class(es) carry test/suite annotations but match neither" >&2
+  echo "split-tests:        surefire nor failsafe default includes; they would NOT be sharded and their" >&2
+  echo "split-tests:        coverage would be missing from the index (under-selection). Rename to" >&2
+  echo "split-tests:        *Test / *IT (or extend is_ut/is_it) so they are indexed:" >&2
+  printf '  %s\n' "${UNMATCHED_TESTS[@]}" >&2
+  exit 1
+fi
 if ((${#UNMATCHED[@]} > 0)); then
-  echo "split-tests: WARNING: ${#UNMATCHED[@]} test source(s) match neither surefire nor failsafe default includes;" >&2
-  echo "split-tests:          they are NOT sharded and their coverage will be missing from the index:" >&2
-  printf '  %s\n' "${UNMATCHED[@]}" >&2
+  echo "split-tests: note: ${#UNMATCHED[@]} non-test source(s) under src/test/java were not sharded (helpers/mocks)."
 fi
