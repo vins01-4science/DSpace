@@ -91,8 +91,14 @@ ERR_LOG="$OUT_DIR/impacted.err"
 : > "$ERR_LOG"
 
 impacted_for() { # args... -> feed stdout into the caller's read loop
-  if ! "$TG" "$@" 2>>"$ERR_LOG"; then
-    echo "!! $TG $* FAILED (see $ERR_LOG)" >&2
+  # S9: a tool that exits non-zero WITHOUT writing to stderr must not be treated as an
+  # empty affected set. Record the failure IN $ERR_LOG — file-based, so it survives the
+  # caller's process-substitution subshell — and let the guard after the loops fail loud.
+  local rc=0
+  "$TG" "$@" 2>>"$ERR_LOG" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "!! $TG $* FAILED (exit $rc)" >>"$ERR_LOG"
+    echo "!! $TG $* FAILED (exit $rc, see $ERR_LOG)" >&2
   fi
 }
 

@@ -241,6 +241,44 @@ s10() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# S9 — a tool that exits non-zero with NO stderr must not yield a silent empty set
+# ---------------------------------------------------------------------------
+s9() {
+  local af="$TG/affected.sh" dir base head rc
+  dir="$(newtmp)"
+  mkdir -p "$dir/tools/test-graph"
+  cp "$af" "$dir/tools/test-graph/affected.sh"
+  cat > "$dir/tools/test-graph/run.sh" <<'STUB'
+#!/usr/bin/env bash
+# Fail loudly on the process exit code but write nothing (no stderr).
+exit 1
+STUB
+  chmod +x "$dir/tools/test-graph/run.sh"
+  (
+    cd "$dir" || exit 1
+    git init -q .
+    git config user.email t@t.t; git config user.name t
+    mkdir -p dspace-api/src/main/java/org/dspace/impact
+    printf 'base\n' > dspace-api/README
+    git add -A && git commit -qm base
+    base="$(git rev-parse HEAD)"
+    printf 'package org.dspace.impact;\npublic class Changed {}\n' \
+      > dspace-api/src/main/java/org/dspace/impact/Changed.java
+    git add -A && git commit -qm add
+    head="$(git rev-parse HEAD)"
+    bash tools/test-graph/affected.sh --db /dev/null --base "$base" --head "$head" \
+      --out "$dir/out" > "$dir/out.log" 2>&1
+    echo $? > "$dir/rc"
+  ) || { fail "S9 affected.sh run crashed"; return; }
+  rc="$(cat "$dir/rc" 2>/dev/null || echo 0)"
+  if [ "$rc" -ne 0 ] && grep -q 'refusing to emit' "$dir/out.log"; then
+    pass "S9 silent tool failure fails loud (no vacuous empty set)"
+  else
+    fail "S9 silent tool failure gave rc=$rc (want nonzero + 'refusing to emit')"
+  fi
+}
+
 f3
 f5
 f6
@@ -248,6 +286,7 @@ s2s8
 s5
 s4
 s10
+s9
 r0( ) {
   local tg="$TG/TestGraph.java" af="$TG/affected.sh"
   local m="$ROOT/.github/workflows/merge-patch.yml" t="$AFFECTED_YML" ok=1
