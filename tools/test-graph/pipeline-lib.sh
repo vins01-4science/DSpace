@@ -17,6 +17,14 @@ jacoco_version() {
 # ---------------------------------------------------------------------------
 # Blast radius: a change to any of these paths invalidates the whole index,
 # so the gate must fall back to the full reactor rather than a narrowed set.
+#
+# G8 (accepted trade-off): `^dspace/config/` deliberately forces the FULL
+# UT+IT reactor even though the index has a config model (config_keys /
+# property_impact / config_consumers). That model is known-incomplete —
+# constructed keys, SpEL, nested YAML and included .cfg files can miss
+# coverage — so narrowing config changes would risk under-selection. Narrow
+# this only after the config model is proven complete for the changed file
+# (e.g. a per-file "modeled" flag from the index), never on cost grounds alone.
 # ---------------------------------------------------------------------------
 BLAST_RE='(^|/)pom\.xml$|^dspace/config/|^dspace-test-trace/|^src/|^\.github/|^\.mvn/|^tools/|(^|/)Dockerfile|(^|/)docker-compose|(^|/)checkstyle\.xml$'
 
