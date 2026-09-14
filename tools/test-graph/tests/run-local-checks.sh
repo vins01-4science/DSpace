@@ -21,6 +21,10 @@
 #   R0  ASM phase-0 reflection safety net is wired end to end: TestGraph.java
 #       extracts reflection sites, affected.sh emits a force_full marker, and both
 #       workflows fail closed (full reactor) when the marker is present.
+#   G7  the R0/R1/R3/S7/S10/S14 probes execute the real logic (compile fixtures and
+#       run TestGraph; run the merge-patch decision body; parse the workflow pins)
+#       instead of only grepping for wiring strings. Executable parts need javac and
+#       the local .m2 runtime jars, and are skipped on a bare CI runner.
 #
 # Usage: tools/test-graph/tests/run-local-checks.sh
 set -uo pipefail
@@ -37,6 +41,25 @@ trap cleanup EXIT
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAIL=1; }
 newtmp() { local d; d="$(mktemp -d)"; TMPDIRS+=("$d"); echo "$d"; }
+
+# Newest non-sources/javadoc jar for a .m2 artifact path, or empty.
+find_jar() {
+  find "${M2:-$HOME/.m2/repository}/$1" -name '*.jar' \
+    ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | sort -V | tail -1
+}
+
+# True when the test-graph runtime jars and a JDK javac are available locally, so the
+# executable fixture probes can compile and run TestGraph. They are skipped on a bare
+# CI runner (tooling-checks.yml installs only a JDK and the static wiring checks run).
+tg_runtime_ok() {
+  command -v javac >/dev/null 2>&1 || return 1
+  local j
+  for j in org/jacoco/org.jacoco.core org/ow2/asm/asm org/ow2/asm/asm-tree \
+           org/ow2/asm/asm-commons org/xerial/sqlite-jdbc; do
+    [ -n "$(find_jar "$j")" ] || return 1
+  done
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # F3 — affected.sh test-file provenance
@@ -236,13 +259,101 @@ s4() {
 # S10 — merge-patch must not skip (and advance built-from) for a non-doc change
 # ---------------------------------------------------------------------------
 s10() {
-  local y="$ROOT/.github/workflows/merge-patch.yml" n
+  local y="$ROOT/.github/workflows/merge-patch.yml" n ok=1
   n="$(grep -c 'echo "skip=1"' "$y" 2>/dev/null || true)"
-  if grep -q 'FALLBACK_MODULES' "$y" && grep -q 'INERT_RE' "$y" && [ "$n" -eq 1 ]; then
-    pass "S10 merge-patch skip is gated by an inert check + module fallback"
-  else
-    fail "S10 merge-patch fallback missing (skip emissions=$n)"
+  if ! grep -q 'FALLBACK_MODULES' "$y" || ! grep -q 'INERT_RE' "$y" || [ "$n" -ne 1 ]; then
+    fail "S10 merge-patch fallback missing (skip emissions=$n)"; return
   fi
+
+  # Executable: run the real 'Compute affected tests' decision body against a stub
+  # affected.sh + a real git repo, and assert the docs-skip / blast / module decisions.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "  S10 executable fixture skipped (python3 absent)"
+  else
+    local d base rc
+    d="$(newtmp)"
+    python3 - "$y" "$d/step.sh" <<'PY' || { fail "S10 could not extract the affected step"; return; }
+import sys, yaml
+
+with open(sys.argv[1]) as fh:
+    doc = yaml.safe_load(fh)
+body = None
+for s in doc['jobs']['patch']['steps']:
+    if s.get('id') == 'affected':
+        body = s.get('run')
+        break
+assert body, 'affected step not found'
+body = body.replace('${{ steps.baseline.outputs.db }}', '$DB')
+body = body.replace('${{ steps.baseline.outputs.base_sha }}', '$BASE')
+body = body.replace('${{ github.sha }}', '$HEAD')
+with open(sys.argv[2], 'w') as fh:
+    fh.write('set -euo pipefail\n' + body)
+PY
+    mkdir -p "$d/repo/tools/test-graph"
+    cat > "$d/repo/tools/test-graph/affected.sh" <<'STUB'
+#!/usr/bin/env bash
+out=target/test-graph/affected
+mkdir -p "$out"
+printf '%s' "${STUB_UT:-}" > "$out/ut.csv"
+printf '%s' "${STUB_IT:-}" > "$out/it.csv"
+[ "${STUB_FORCE:-0}" = "1" ] && echo "reflection probe" > "$out/force_full"
+exit 0
+STUB
+    (
+      cd "$d/repo" || exit 1
+      git init -q .
+      git config user.email t@t.t; git config user.name t
+      printf '# base\n' > README.md
+      mkdir -p dspace-api
+      printf '<project/>\n' > dspace-api/pom.xml
+      git add -A && git commit -qm base
+    ) || { fail "S10 fixture repo init failed"; return; }
+    base="$(git -C "$d/repo" rev-parse HEAD)"
+
+    run_case() {
+      local name="$1" path="$2" ut="$3" it="$4" force="$5"
+      git -C "$d/repo" reset -q --hard "$base" >/dev/null 2>&1
+      mkdir -p "$d/repo/$(dirname "$path")"
+      printf 'x\n' > "$d/repo/$path"
+      git -C "$d/repo" add -A >/dev/null 2>&1
+      git -C "$d/repo" commit -qm "$name" >/dev/null 2>&1
+      local head; head="$(git -C "$d/repo" rev-parse HEAD)"
+      : > "$d/out"
+      ( cd "$d/repo" && DB="$d/db.sqlite" BASE="$base" HEAD="$head" \
+          GITHUB_OUTPUT="$d/out" STUB_UT="$ut" STUB_IT="$it" STUB_FORCE="$force" \
+          bash "$d/step.sh" ) >"$d/$name.log" 2>&1
+      echo $?
+    }
+
+    # 1) docs-only, index found nothing -> must skip (baseline already current).
+    rc="$(run_case docs docs/guide.md "" "" 0)"
+    { [ "$rc" -eq 0 ] && grep -q '^skip=1$' "$d/out" && grep -q '^blast=0$' "$d/out"; } \
+      || { echo "  S10 docs-only did not skip (rc=$rc):"; sed 's/^/    /' "$d/docs.log"; ok=0; }
+
+    # 2) unclassified non-doc with no known module -> must run the full reactor.
+    rc="$(run_case unclassified libfoo/data.sql "" "" 0)"
+    { [ "$rc" -eq 0 ] && ! grep -q '^skip=1$' "$d/out" && grep -q '^blast=1$' "$d/out"; } \
+      || { echo "  S10 unclassified change skipped (rc=$rc):"; sed 's/^/    /' "$d/unclassified.log"; ok=0; }
+
+    # 3) empty index set but a dspace module changed -> module-suite fallback.
+    rc="$(run_case module dspace-api/src/main/java/org/x/New.java "" "" 0)"
+    { [ "$rc" -eq 0 ] && ! grep -q '^skip=1$' "$d/out" && grep -q '^modules=dspace-api$' "$d/out"; } \
+      || { echo "  S10 module fallback wrong (rc=$rc):"; sed 's/^/    /' "$d/module.log"; ok=0; }
+
+    # 4) index found a UT -> narrowed run, never a skip.
+    rc="$(run_case ut dspace-api/src/main/java/org/x/New.java FooTest "" 0)"
+    { [ "$rc" -eq 0 ] && ! grep -q '^skip=1$' "$d/out" && grep -q '^ut=FooTest$' "$d/out"; } \
+      || { echo "  S10 narrowed UT run wrong (rc=$rc):"; sed 's/^/    /' "$d/ut.log"; ok=0; }
+
+    # 5) reflection marker present -> must force the full reactor, never a skip.
+    rc="$(run_case force dspace-api/src/main/java/org/x/New.java "" "" 1)"
+    { [ "$rc" -eq 0 ] && ! grep -q '^skip=1$' "$d/out" && grep -q '^blast=1$' "$d/out" \
+        && grep -q 'Reflection safety net' "$d/force.log"; } \
+      || { echo "  S10 reflection marker ignored (rc=$rc):"; sed 's/^/    /' "$d/force.log"; ok=0; }
+  fi
+
+  if [ "$ok" -eq 1 ]; then pass "S10 merge-patch skip gated (docs skip; blast/module/UT/reflection run)"
+  else fail "S10 merge-patch fallback"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -312,7 +423,84 @@ r0( ) {
   # the index build must emit reflection_sites, or every run fails closed to full.
   grep -qE '"\$TG" reflection --module' "$TG/phase-module.sh" \
     || { echo "  R0 phase-module.sh does not emit reflection_sites"; ok=0; }
-  if [ "$ok" -eq 1 ]; then pass "R0 reflection safety net wired (extract -> marker -> workflows)"
+
+  # Executable: compile a class with forName/loadClass/ServiceLoader sites, run the
+  # real ASM pass, then resolve constant/dynamic targets against a synthetic index.
+  if ! tg_runtime_ok; then
+    echo "  R0 executable fixture skipped (runtime jars / javac absent)"
+  else
+    local m2="${M2:-$HOME/.m2/repository}" d mod tsv rc
+    d="$(newtmp)"; mod="$d/mod"
+    mkdir -p "$mod/src/org/dspace/probe0" "$mod/target/classes"
+    cat > "$mod/src/org/dspace/probe0/ReflectProbe.java" <<'JAVA'
+package org.dspace.probe0;
+
+import java.util.ServiceLoader;
+
+public class ReflectProbe {
+    public static Class<?> constant() throws Exception {
+        return Class.forName("org.dspace.core.Plugin");
+    }
+    public static Class<?> dynamic(String n) throws Exception {
+        return Class.forName(n);
+    }
+    public static Class<?> loader() throws Exception {
+        return ClassLoader.getSystemClassLoader().loadClass("org.dspace.other.Dynamic");
+    }
+    public static ServiceLoader<Runnable> svc() {
+        return ServiceLoader.load(Runnable.class);
+    }
+}
+JAVA
+    if ! javac -d "$mod/target/classes" \
+         "$mod/src/org/dspace/probe0/ReflectProbe.java" 2>"$d/javac.log"; then
+      echo "  R0 javac failed:"; sed 's/^/    /' "$d/javac.log"; ok=0
+    elif ! M2="$m2" bash "$TG/run.sh" reflection --module "$mod" >"$d/refl.log" 2>&1; then
+      echo "  R0 reflection pass failed:"; sed 's/^/    /' "$d/refl.log"; ok=0
+    else
+      tsv="$mod/target/test-graph/reflection_sites.tsv"
+      grep -qF $'\tforName\torg.dspace.core.Plugin' "$tsv" \
+        || { echo "  R0 missed the constant forName target"; ok=0; }
+      [ -n "$(awk -F'\t' '$2=="forName" && $3==""{print; exit}' "$tsv")" ] \
+        || { echo "  R0 missed the dynamic forName site (empty target)"; ok=0; }
+      grep -qF $'\tloadClass\torg.dspace.other.Dynamic' "$tsv" \
+        || { echo "  R0 missed the loadClass target"; ok=0; }
+      grep -qF $'\tserviceLoader\tjava.lang.Runnable' "$tsv" \
+        || { echo "  R0 missed the ServiceLoader target"; ok=0; }
+    fi
+    sqlite3 "$d/roadmap.sqlite" <<'SQL'
+CREATE TABLE reflection_sites(owner TEXT, kind TEXT, target TEXT);
+INSERT INTO reflection_sites VALUES
+ ('org.dspace.probe0.ConstantCaller','forName','org.dspace.core.Plugin'),
+ ('org.dspace.probe0.DynamicCaller','forName',''),
+ ('org.dspace.probe0.PrefixCaller','forNamePrefix','org.dspace.svc.');
+SQL
+    rc=0
+    printf 'org.dspace.core.Plugin\norg.dspace.probe0.DynamicCaller\norg.dspace.svc.Impl\norg.other.Unrelated\n' \
+      | M2="$m2" bash "$TG/run.sh" reflection-resolve --db "$d/roadmap.sqlite" \
+        >"$d/plan" 2>"$d/plan.err" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "  R0 reflection-resolve rc=$rc:"; sed 's/^/    /' "$d/plan.err"; ok=0
+    else
+      grep -qF $'resolve\torg.dspace.probe0.ConstantCaller' "$d/plan" \
+        || { echo "  R0 did not resolve a constant target to its caller"; ok=0; }
+      grep -qF $'dynamic\torg.dspace.probe0.DynamicCaller' "$d/plan" \
+        || { echo "  R0 did not fail closed on a dynamic caller"; ok=0; }
+      grep -qF $'dynamic\torg.dspace.svc.Impl' "$d/plan" \
+        || { echo "  R0 did not fail closed on a border target"; ok=0; }
+      grep -qF 'org.other.Unrelated' "$d/plan" \
+        && { echo "  R0 flagged an unrelated class"; ok=0; }
+    fi
+    sqlite3 "$d/stale.sqlite" 'CREATE TABLE t(x);'
+    rc=0
+    printf 'org.dspace.core.Plugin\n' \
+      | M2="$m2" bash "$TG/run.sh" reflection-resolve --db "$d/stale.sqlite" \
+        >/dev/null 2>"$d/stale.err" || rc=$?
+    { [ "$rc" -eq 3 ] && grep -q 'forcing full reactor' "$d/stale.err"; } \
+      || { echo "  R0 stale index did not fail closed (rc=$rc)"; ok=0; }
+  fi
+
+  if [ "$ok" -eq 1 ]; then pass "R0 reflection safety net (extract -> resolve -> marker -> workflows)"
   else fail "R0 reflection safety net wiring"; fi
 }
 r0
@@ -324,8 +512,54 @@ r1() {
              '"Prefix"' 'borders.add' 'cls.startsWith(p)' ; do
     grep -qF -- "$pat" "$tg" || { echo "  R1 TestGraph missing: $pat"; ok=0; }
   done
-  if [ "$ok" -eq 1 ]; then pass "R1 string/border analysis wired (concat prefix -> fail closed)"
-  else fail "R1 string/border analysis wiring"; fi
+
+  # Executable: a concatenated / StringBuilder / String.format target must become a
+  # namespace border; a local constant must still resolve to its literal target.
+  if ! tg_runtime_ok; then
+    echo "  R1 executable fixture skipped (runtime jars / javac absent)"
+  else
+    local m2="${M2:-$HOME/.m2/repository}" d mod tsv
+    d="$(newtmp)"; mod="$d/mod"
+    mkdir -p "$mod/src/org/dspace/probe1" "$mod/target/classes"
+    cat > "$mod/src/org/dspace/probe1/BorderProbe.java" <<'JAVA'
+package org.dspace.probe1;
+
+public class BorderProbe {
+    public static Class<?> concat(String n) throws Exception {
+        return Class.forName("org.dspace." + n);
+    }
+    public static Class<?> sb(String n) throws Exception {
+        return Class.forName(new StringBuilder("org.dspace.svc.").append(n).toString());
+    }
+    public static Class<?> formatted(String n) throws Exception {
+        return Class.forName(String.format("org.dspace.fmt.%s", n));
+    }
+    public static Class<?> local() throws Exception {
+        String c = "org.dspace.core.Plugin";
+        return Class.forName(c);
+    }
+}
+JAVA
+    if ! javac -d "$mod/target/classes" \
+         "$mod/src/org/dspace/probe1/BorderProbe.java" 2>"$d/javac.log"; then
+      echo "  R1 javac failed:"; sed 's/^/    /' "$d/javac.log"; ok=0
+    elif ! M2="$m2" bash "$TG/run.sh" reflection --module "$mod" >"$d/refl.log" 2>&1; then
+      echo "  R1 reflection pass failed:"; sed 's/^/    /' "$d/refl.log"; ok=0
+    else
+      tsv="$mod/target/test-graph/reflection_sites.tsv"
+      grep -qF $'\tforNamePrefix\torg.dspace.svc.' "$tsv" \
+        || { echo "  R1 missed the StringBuilder border"; ok=0; }
+      grep -qF $'\tforNamePrefix\torg.dspace.fmt.' "$tsv" \
+        || { echo "  R1 missed the String.format border (G3)"; ok=0; }
+      grep -qF $'\tforNamePrefix\torg.dspace.' "$tsv" \
+        || { echo "  R1 missed the concat border"; ok=0; }
+      grep -qF $'\tforName\torg.dspace.core.Plugin' "$tsv" \
+        || { echo "  R1 lost local-constant propagation"; ok=0; }
+    fi
+  fi
+
+  if [ "$ok" -eq 1 ]; then pass "R1 string/border analysis (concat/StringBuilder/format -> border)"
+  else fail "R1 string/border analysis"; fi
 }
 r1
 
@@ -387,6 +621,51 @@ r3() {
   for pat in 'addValue' 'ConstantDynamic' 'getBootstrapMethod' 'org.objectweb.asm.Handle' '"indy"' ; do
     grep -qF -- "$pat" "$tg" || { echo "  R3 TestGraph missing: $pat"; ok=0; }
   done
+
+  # Executable: a class referenced ONLY via a method handle (`Helper::name`) or a
+  # class literal (`Helper.class`) must still produce a static edge to Helper.
+  if ! tg_runtime_ok; then
+    echo "  R3 executable fixture skipped (runtime jars / javac absent)"
+  else
+    local m2="${M2:-$HOME/.m2/repository}" d mod
+    d="$(newtmp)"; mod="$d/mod"
+    mkdir -p "$mod/src/org/dspace/probe3" "$mod/target/classes"
+    cat > "$mod/src/org/dspace/probe3/Helper.java" <<'JAVA'
+package org.dspace.probe3;
+
+class Helper {
+    static String name() {
+        return "h";
+    }
+}
+JAVA
+    cat > "$mod/src/org/dspace/probe3/EdgeProbe.java" <<'JAVA'
+package org.dspace.probe3;
+
+import java.util.function.Supplier;
+
+public class EdgeProbe {
+    public static Supplier<String> ref() {
+        return Helper::name;
+    }
+    public static Class<?> lit() {
+        return Helper.class;
+    }
+}
+JAVA
+    if ! javac -d "$mod/target/classes" \
+         "$mod/src/org/dspace/probe3/Helper.java" \
+         "$mod/src/org/dspace/probe3/EdgeProbe.java" 2>"$d/javac.log"; then
+      echo "  R3 javac failed:"; sed 's/^/    /' "$d/javac.log"; ok=0
+    elif ! M2="$m2" bash "$TG/run.sh" static --module "$mod" >"$d/static.log" 2>&1; then
+      echo "  R3 static pass failed:"; sed 's/^/    /' "$d/static.log"; ok=0
+    else
+      grep -qF $'org.dspace.probe3.EdgeProbe\torg.dspace.probe3.Helper' \
+        "$mod/target/test-graph/edges.tsv" \
+        || { echo "  R3 missed the method-handle/class-literal edge"; ok=0; }
+    fi
+  fi
+
   if [ "$ok" -eq 1 ]; then pass "R3 dynamic-dispatch edges extracted (indy/handles/class literals)"
   else fail "R3 dynamic-dispatch edge wiring"; fi
 }
@@ -429,37 +708,112 @@ s7() {
   [ -f "$pc" ] || { fail "S7 PerTestCoverage.java not found"; return; }
   # Unique per-invocation key: a per-JVM token + monotonic sequence appended to the
   # sanitized stem, so parameterized tests / retries no longer overwrite one file.
-  for pat in 'AtomicLong' 'ProcessHandle' 'JVM' '"__"' 'Outer$Inner' '[^a-zA-Z0-9.$_-]'; do
+  for pat in 'AtomicLong' 'ProcessHandle' 'JVM' '"__"' 'Outer$Inner' '[^a-zA-Z0-9.$_-]' 'execFileName('; do
     grep -qF -- "$pat" "$pc" || { echo "  S7 PerTestCoverage missing: $pat"; ok=0; }
   done
   # The old truncating single-file key must be gone.
   if grep -qF 'safe + ".exec"' "$pc"; then
     echo "  S7 still uses the truncating single-file key"; ok=0
   fi
-  if [ "$ok" -eq 1 ]; then pass "S7 per-invocation coverage keys (no overwrite; \$ preserved)"
+
+  # Executable: compile the real listener and call execFileName twice — the names
+  # must differ (no overwrite) and `$` must survive the sanitizer (nested selectable).
+  local cp="" j
+  for a in org/junit/platform/junit-platform-launcher \
+           org/junit/platform/junit-platform-engine \
+           org/junit/platform/junit-platform-commons \
+           org/opentest4j/opentest4j org/apiguardian/apiguardian-api; do
+    j="$(find_jar "$a")"; [ -n "$j" ] && cp="$cp:$j"
+  done
+  cp="${cp#:}"
+  if [ -z "$cp" ] || ! command -v javac >/dev/null 2>&1; then
+    echo "  S7 executable fixture skipped (junit-platform jars / javac absent)"
+  else
+    local d rc
+    d="$(newtmp)"
+    cat > "$d/S7Probe.java" <<'JAVA'
+package org.dspace.testtrace;
+
+public class S7Probe {
+    public static void main(String[] args) {
+        String a = PerTestCoverage.execFileName("org.x.Outer$Inner", "case1");
+        String b = PerTestCoverage.execFileName("org.x.Outer$Inner", "case1");
+        if (a.equals(b)) { System.err.println("overwrite: " + a); System.exit(1); }
+        if (!a.contains("org.x.Outer$Inner.case1")) {
+            System.err.println("dropped-': " + a); System.exit(2);
+        }
+        if (!a.matches("org\\.x\\.Outer\\$Inner\\.case1__[0-9a-f]+_[0-9a-f]+")) {
+            System.err.println("bad-shape: " + a); System.exit(3);
+        }
+        System.out.println(a);
+        System.out.println(b);
+    }
+}
+JAVA
+    rc=0
+    javac -cp "$cp" -d "$d" "$d/S7Probe.java" "$pc" >"$d/javac.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "  S7 javac failed:"; sed 's/^/    /' "$d/javac.log"; ok=0
+    else
+      rc=0
+      java -cp "$d:$cp" org.dspace.testtrace.S7Probe >"$d/run.log" 2>&1 || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        echo "  S7 execFileName probe failed rc=$rc:"; sed 's/^/    /' "$d/run.log"; ok=0
+      fi
+    fi
+  fi
+
+  if [ "$ok" -eq 1 ]; then pass "S7 per-invocation coverage keys (distinct names; \$ preserved)"
   else fail "S7 per-invocation keys"; fi
 }
 s7
 
 s14() {
-  local wfdir="$ROOT/.github/workflows" ok=1 bad
+  local wfdir="$ROOT/.github/workflows" ok=1 report
   # S14: every external action must be pinned to a full 40-hex commit SHA, with the
   # human-readable tag kept in a trailing comment. Local reusable workflows (./...)
-  # are exempt (they live in this repo).
-  bad=$(grep -rhoE 'uses:[[:space:]]*[^[:space:]]+' "$wfdir"/*.yml \
-        | sed 's/^uses:[[:space:]]*//' \
-        | grep -vE '^\./' \
-        | grep -vE '@[0-9a-f]{40}$' || true)
-  if [ -n "$bad" ]; then
-    echo "  S14 unpinned external action(s):"
-    printf '%s\n' "$bad" | sed 's/^/    /'
-    ok=0
+  # and docker:// refs are exempt. Parsed from the raw YAML so the pin and the
+  # comment are validated together (not a substring tautology).
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "  S14 parse probe skipped (python3 absent)"
+  else
+    report="$(python3 - "$wfdir" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+pat = re.compile(r'^\s*-?\s*uses:\s*["\']?(\S+?)["\']?\s*(?:#\s*(\S+))?\s*$')
+bad = []
+for f in sorted(root.glob('*.yml')):
+    for n, line in enumerate(f.read_text().splitlines(), 1):
+        m = pat.match(line)
+        if not m:
+            continue
+        ref = m.group(1)
+        if ref.startswith('./') or ref.startswith('docker://'):
+            continue
+        if '@' not in ref:
+            bad.append(f"{f.name}:{n}: unpinned {ref}")
+            continue
+        name, _, pin = ref.rpartition('@')
+        if not re.fullmatch(r'[0-9a-f]{40}', pin):
+            bad.append(f"{f.name}:{n}: not a 40-hex SHA: {ref}")
+        elif not m.group(2):
+            bad.append(f"{f.name}:{n}: missing tag comment: {ref}")
+for b in bad:
+    print(b)
+PY
+)"
+    if [ -n "$report" ]; then
+      echo "  S14 unpinned/mis-pinned external action(s):"
+      printf '%s\n' "$report" | sed 's/^/    /'
+      ok=0
+    fi
   fi
   # A pinned entry must keep the original tag as a comment for readability.
   if ! grep -rqE 'uses: actions/checkout@[0-9a-f]{40} # v7' "$wfdir"/*.yml; then
     echo "  S14 actions/checkout pin comment missing"; ok=0
   fi
-  if [ "$ok" -eq 1 ]; then pass "S14 all external actions pinned by commit SHA"
+  if [ "$ok" -eq 1 ]; then pass "S14 all external actions pinned by commit SHA (parsed)"
   else fail "S14 actions not pinned by SHA"; fi
 }
 s14

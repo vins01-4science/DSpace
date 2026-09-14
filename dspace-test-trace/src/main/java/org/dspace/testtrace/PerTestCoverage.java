@@ -135,11 +135,21 @@ public class PerTestCoverage implements TestExecutionListener {
             className = classSource.getClassName();
         }
         Files.createDirectories(OUT_DIR);
-        String safe = (className + "." + methodName).replaceAll("[^a-zA-Z0-9.$_-]", "_");
-        String unique = safe + "__" + JVM + "_" + Long.toHexString(SEQ.incrementAndGet());
+        String unique = execFileName(className, methodName);
         File out = OUT_DIR.resolve(unique + ".exec").toFile();
         try (FileOutputStream fos = new FileOutputStream(out)) {
             fos.write(data);
         }
+    }
+
+    /**
+     * Build the exec-file stem for one invocation: the sanitized {@code Class.method}
+     * plus a per-JVM, per-invocation suffix, so repeated invocations never overwrite.
+     * Extracted (package-private, static) so the S7 invariant can be exercised without
+     * a live JaCoCo agent.
+     */
+    static String execFileName(String className, String methodName) {
+        String safe = (className + "." + methodName).replaceAll("[^a-zA-Z0-9.$_-]", "_");
+        return safe + "__" + JVM + "_" + Long.toHexString(SEQ.incrementAndGet());
     }
 }

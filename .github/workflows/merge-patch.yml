@@ -233,7 +233,7 @@ jobs:
               echo "skip=1" >> "$GITHUB_OUTPUT"
             else
               FALLBACK_MODULES=$(printf '%s\n' "$CHANGED" | cut -d/ -f1 | grep '^dspace' | sort -u \
-                | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, -)
+                | while read -r m; do [ -f "$m/pom.xml" ] && echo "$m"; done | paste -sd, - || true)
               if [ -z "$FALLBACK_MODULES" ]; then
                 # Unclassified non-doc change with no known module -> full reactor.
                 BLAST=1
