@@ -280,7 +280,7 @@ public class ItemServiceImpl extends DSpaceObjectServiceImpl<Item> implements It
         workspaceItem.setItem(item);
 
 
-        log.info(LogHelper.getHeader(context, "create_item", "item_id="
+        log.info(LogHelper.getHeader(context, "create_item_probe", "item_id="
                 + item.getID()));
 
         return item;
