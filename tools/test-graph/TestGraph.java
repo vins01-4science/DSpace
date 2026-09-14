@@ -1637,6 +1637,7 @@ public class TestGraph {
         Path perTest = opts.containsKey("per-test") ? Paths.get(opts.get("per-test")) : null;
         Path classesDir = opts.containsKey("classes") ? Paths.get(opts.get("classes")) : null;
 
+        boolean configMode = opts.containsKey("configfile");
         List<String> diffLines;
         if (opts.containsKey("diff")) {
             String d = opts.get("diff");
@@ -1647,18 +1648,25 @@ public class TestGraph {
             }
         } else if (opts.containsKey("base")) {
             diffLines = gitDiff(opts.get("base"), opts.getOrDefault("head", "HEAD"));
-        } else if (opts.containsKey("configfile")) {
-            // config-only refinement without an explicit diff: treat the config file's own
-            // content as the diff so parseConfigEntities sees all entities -> class-level union.
-            diffLines = Files.readAllLines(Paths.get(opts.get("configfile")), StandardCharsets.UTF_8);
+        } else if (configMode) {
+            diffLines = Collections.emptyList();
         } else {
             System.err.println("refine requires --diff <file|-> or --base <ref> [--head <ref>] (or --configfile for config-only refinement)");
             System.exit(2);
             return;
         }
+        if (configMode) {
+            // G5: scope entity parsing to the config file itself. affected.sh passes
+            // --configfile together with --base/--head, so without this override the
+            // whole PR diff would be parsed for every XML file (the config-file branch
+            // below was dead and every XML invocation ingested the entire diff).
+            diffLines = Files.readAllLines(Paths.get(opts.get("configfile")), StandardCharsets.UTF_8);
+        }
 
-        // .java changes -> method/class line ranges (existing behavior)
-        Map<String, Set<Integer>> javaChanged = parseDiff(diffLines);
+        // .java changes -> method/class line ranges (existing behavior). In config mode Java
+        // changes are refined once by the dedicated whole-diff call in affected.sh, so skip
+        // them here to avoid re-adding every changed class per XML file.
+        Map<String, Set<Integer>> javaChanged = configMode ? Collections.emptyMap() : parseDiff(diffLines);
 
         // config XML changes -> consumer method line ranges (item B)
         Map<String, Set<Integer>> methodLinesMap = new HashMap<>();

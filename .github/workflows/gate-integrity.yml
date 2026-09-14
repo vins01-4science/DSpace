@@ -31,7 +31,8 @@ jobs:
         run: |
           set -euo pipefail
           # Paths whose change would let a PR alter how its own verdict is computed.
-          PROTECTED='^(\.github/|tools/|dspace-test-trace/)'
+          # pom.xml (any module) carries the surefire/failsafe/JaCoCo test wiring too (G11).
+          PROTECTED='^(\.github/|tools/|dspace-test-trace/)|(^|/)pom\.xml$'
           PR="repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}"
           # G2: GitHub caps the files API at 3000 entries. If the PR reports more
           # changed files than the API returned, the list is incomplete: fail closed

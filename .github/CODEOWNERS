@@ -5,3 +5,6 @@
 /.github/            @vins01-4science
 /tools/              @vins01-4science
 /dspace-test-trace/  @vins01-4science
+# pom.xml carries the test/scoping wiring (surefire/failsafe/JaCoCo) too (G11).
+/pom.xml             @vins01-4science
+**/pom.xml           @vins01-4science

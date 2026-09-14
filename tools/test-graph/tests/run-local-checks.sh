@@ -476,11 +476,13 @@ s1() {
     grep -qF '\.github/' "$wf" || { echo "  S1 gate missing .github/ path"; ok=0; }
     grep -qF 'tools/' "$wf" || { echo "  S1 gate missing tools/ path"; ok=0; }
     grep -qF 'dspace-test-trace/' "$wf" || { echo "  S1 gate missing dspace-test-trace/ path"; ok=0; }
+    grep -qF 'pom\.xml' "$wf" || { echo "  S1 gate missing pom.xml path"; ok=0; }
   fi
   if [ -f "$co" ]; then
     grep -qF '/.github/' "$co" || { echo "  S1 CODEOWNERS missing /.github/"; ok=0; }
     grep -qF '/tools/' "$co" || { echo "  S1 CODEOWNERS missing /tools/"; ok=0; }
     grep -qF '/dspace-test-trace/' "$co" || { echo "  S1 CODEOWNERS missing /dspace-test-trace/"; ok=0; }
+    grep -qF 'pom.xml' "$co" || { echo "  S1 CODEOWNERS missing pom.xml"; ok=0; }
   fi
 
   # S1 executable probe (G1/G2): extract the gate's OWN run-script from the workflow
@@ -531,6 +533,11 @@ case "$FAKE_MODE" in
       */files*) printf '%s\n' '{"filename":"dspace-api/Foo.java"}';;
       *) echo 1;;
     esac;;
+  pom)
+    case "$args" in
+      */files*) printf '%s\n' '{"filename":"pom.xml"}';;
+      *) echo 1;;
+    esac;;
 esac
 GH
           chmod +x "$gd/bin/gh"
@@ -543,6 +550,9 @@ GH
           grep -q 'Cannot fully enumerate' "$gd/o2" || { echo "  S1 gate over-cap path gave no reason"; ok=0; }
           FAKE_MODE=inert PATH="$gd/bin:$PATH" GH_TOKEN=dummy bash "$gd/gate.run.sh" >"$gd/o3" 2>&1; rc=$?
           [ "$rc" -eq 0 ] || { echo "  S1 gate false-positives on an inert PR"; ok=0; }
+          FAKE_MODE=pom PATH="$gd/bin:$PATH" GH_TOKEN=dummy bash "$gd/gate.run.sh" >"$gd/o4" 2>&1; rc=$?
+          [ "$rc" -ne 0 ] || { echo "  S1 gate MISSED a protected pom.xml change"; ok=0; }
+          grep -q 'modifies the test pipeline' "$gd/o4" || { echo "  S1 gate pom.xml path gave no reason"; ok=0; }
         fi
         rm -rf "$gd"
       fi
